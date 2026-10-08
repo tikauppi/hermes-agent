@@ -110,6 +110,8 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    skipped_lifecycle: list[tuple[str, str]] = field(default_factory=list)
+    """Opt-in workflow cards rejected before claim, with a typed reason."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -1507,6 +1509,12 @@ def _dispatch_lane_task(
     skip is recorded on ``result``.
     """
     task_id = row["id"]
+    from hermes_cli import kanban_theseus_lifecycle as _theseus_lifecycle
+
+    lifecycle_ok, lifecycle_reason = _theseus_lifecycle.enforce_dispatch_preflight(conn, task_id)
+    if not lifecycle_ok:
+        result.skipped_lifecycle.append((task_id, lifecycle_reason or "lifecycle_preflight_failed"))
+        return False
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
@@ -1550,6 +1558,16 @@ def _dispatch_lane_task(
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
+        return False
+    try:
+        _theseus_lifecycle.mark_run_started(conn, claimed.id, board=board)
+        claimed = _kb.get_task(conn, claimed.id) or claimed
+    except Exception as exc:
+        if _record_task_failure(
+            conn, claimed.id, f"lifecycle preflight: {exc}",
+            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+        ):
+            result.auto_blocked.append(claimed.id)
         return False
     try:
         resolved_branch_name = None

@@ -1228,6 +1228,34 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
                              ("task_id", "ok", "reason", "fanout", "child_ids", "new_title"), _decompose_ok_line)
 
 
+def _cmd_lifecycle(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_theseus_lifecycle as glh
+
+    action = getattr(args, "lifecycle_action", None)
+    if action not in {"show", "approve"}:
+        return _err("kanban lifecycle: choose show or approve", 2)
+    with kbc.connect_closing() as conn:
+        if action == "show":
+            result = glh.readback(conn, args.task_id)
+            approved = None
+        else:
+            approved = glh.record_terminal_approval(
+                conn,
+                args.task_id,
+                approval_ref=args.approval_ref,
+                approved_at=args.approved_at,
+                now=args.now,
+            )
+            result = {"approved": approved, "task_id": args.task_id}
+    if _json_out(args, result):
+        return 0 if action == "show" or approved else 1
+    if action == "show":
+        print(f"{result['task_id']}: {result['status']} / {result['phase']} (runs={result['run_count']})")
+    else:
+        print(f"{'Approved' if approved else 'Approval expired'} {args.task_id}")
+    return 0 if action == "show" or approved else 1
+
+
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
@@ -1247,7 +1275,7 @@ _HANDLERS = {
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
     "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
     "context": _cmd_context, "specify": _cmd_specify, "decompose": _cmd_decompose,
-    "gc": _cmd_gc,
+    "gc": _cmd_gc, "lifecycle": _cmd_lifecycle,
 }
 
 

@@ -134,6 +134,17 @@ _BOARD_SPECS = [
     )),
 ]
 
+_LIFECYCLE_SPECS = [
+    _cmd("show", [_TASK_ID, _json_flag()], help="Read back an opt-in THESEUS lifecycle task"),
+    _cmd("approve", [
+        _TASK_ID,
+        _arg("--approval-ref", required=True, help="Immutable terminal approval receipt/reference"),
+        _arg("--approved-at", required=True, type=int, help="Approval receipt epoch timestamp"),
+        _arg("--now", type=int, help="Evaluation epoch timestamp (test/replay; default: current time)"),
+        _json_flag(),
+    ], help="Approve a pre-dispatch task without bypassing its expiry"),
+]
+
 # Top-level ``hermes kanban <action>`` records, in ``--help`` order.
 _SPECS = [
     _cmd("init", help="Create kanban.db if missing (idempotent)"),
@@ -145,6 +156,8 @@ _SPECS = [
              "loop — tasks on one board cannot collide with tasks on another. The first board is "
              "'default' and always exists."
          )),
+    _cmd("lifecycle", children=("lifecycle_action", _LIFECYCLE_SPECS),
+         help="Opt-in THESEUS work-package lifecycle operations"),
     _cmd("create", [
         _arg("title", help="Task title"),
         _arg("--body", help="Optional opening post"),
