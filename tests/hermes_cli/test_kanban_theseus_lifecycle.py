@@ -793,29 +793,21 @@ def test_exact_expiry_dispatch_creates_no_run_claim_or_state_transition(
     assert [(event.kind, event.payload) for event in kb.list_events(conn, task_id)] == before_events
 
 
-def test_exact_expiry_native_claim_creates_no_run_or_state_transition(
-    lifecycle_db, monkeypatch
+@pytest.mark.parametrize("now", [150, 151])
+def test_expired_native_claim_is_byte_for_byte_non_mutating(
+    lifecycle_db, monkeypatch, now
 ):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
     assert _approve(conn, task_id, expires_at=150)
-    before_task = kb.get_task(conn, task_id)
-    assert before_task is not None
-    monkeypatch.setattr(glh.time, "time", lambda: 150)
+    before_db = "\n".join(conn.iterdump())
+    before_events = [(event.kind, event.payload) for event in kb.list_events(conn, task_id)]
+    monkeypatch.setattr(glh.time, "time", lambda: now)
 
     assert kb.claim_task(conn, task_id) is None
 
-    after_task = kb.get_task(conn, task_id)
-    assert after_task is not None
-    assert kb.list_runs(conn, task_id) == []
-    assert (after_task.status, after_task.current_step_key) == (
-        before_task.status,
-        before_task.current_step_key,
-    )
-    assert not any(
-        event.kind in {"claimed", "spawned", "theseus_approval_consumed"}
-        for event in kb.list_events(conn, task_id)
-    )
+    assert "\n".join(conn.iterdump()) == before_db
+    assert [(event.kind, event.payload) for event in kb.list_events(conn, task_id)] == before_events
 
 
 def test_native_claim_unblock_and_promote_cannot_bypass_terminal_approval(lifecycle_db):
@@ -830,6 +822,9 @@ def test_native_claim_unblock_and_promote_cannot_bypass_terminal_approval(lifecy
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
     assert kb.claim_task(conn, task_id) is None
     assert kb.list_runs(conn, task_id) == []
+    rejection = kb.list_events(conn, task_id)[-1]
+    assert rejection.kind == "claim_rejected"
+    assert rejection.payload == {"reason": "theseus_lifecycle_gate"}
 
 
 def test_generic_unblock_cannot_bypass_lifecycle_approval(lifecycle_db):

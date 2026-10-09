@@ -2141,7 +2141,10 @@ def claim_task(
     with write_txn(conn):
         from hermes_cli import kanban_theseus_lifecycle as _theseus_lifecycle
         if not _theseus_lifecycle.native_claim_allowed_locked(conn, task_id):
-            _append_event(conn, task_id, "claim_rejected", {"reason": "theseus_lifecycle_gate"})
+            if not _theseus_lifecycle._stored_approval_is_expired(conn, task_id):
+                _append_event(
+                    conn, task_id, "claim_rejected", {"reason": "theseus_lifecycle_gate"}
+                )
             return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
