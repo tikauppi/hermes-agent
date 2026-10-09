@@ -11,11 +11,10 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 import subprocess
 import time
-from contextlib import contextmanager
-from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -48,10 +47,6 @@ ROLE_READY_PHASE = {
     "investigator": INVESTIGATION_RUNNING,
 }
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-_ROLE_DISPATCH_CLAIM_GRANTED: ContextVar[bool] = ContextVar(
-    "theseus_role_dispatch_claim_granted", default=False
-)
-
 _ALLOWED_TRANSITIONS = {
     PLANNED: {AWAITING_TERMINAL_APPROVAL},
     AWAITING_TERMINAL_APPROVAL: {READY_FOR_BUILDER},
@@ -344,7 +339,7 @@ def _decision_for_claim(conn, task_id: str) -> Optional[dict]:
     return None if consumed else decision
 
 
-def native_claim_allowed_locked(conn, task_id: str) -> bool:
+def _claim_allowed_locked(conn, task_id: str, *, role_dispatch: bool) -> bool:
     row = conn.execute(
         "SELECT workflow_template_id, current_step_key, assignee FROM tasks WHERE id=?", (task_id,)
     ).fetchone()
@@ -359,7 +354,7 @@ def native_claim_allowed_locked(conn, task_id: str) -> bool:
     if row["assignee"] != ROLE_PROFILES.get(role):
         return False
     if role in {"reviewer", "investigator"}:
-        if not _ROLE_DISPATCH_CLAIM_GRANTED.get():
+        if not role_dispatch:
             return False
         if (
             metadata.get("authority") != "read-only"
@@ -384,14 +379,14 @@ def native_claim_allowed_locked(conn, task_id: str) -> bool:
     return phase in {REVIEW_RUNNING, INVESTIGATION_RUNNING}
 
 
-@contextmanager
-def _role_dispatch_claim_grant():
-    """Allow this dispatcher call stack to claim a restricted role task."""
-    token = _ROLE_DISPATCH_CLAIM_GRANTED.set(True)
-    try:
-        yield
-    finally:
-        _ROLE_DISPATCH_CLAIM_GRANTED.reset(token)
+def native_claim_allowed_locked(conn, task_id: str) -> bool:
+    """Public/native claims never acquire restricted role tasks."""
+    return _claim_allowed_locked(conn, task_id, role_dispatch=False)
+
+
+def dispatch_claim_allowed_locked(conn, task_id: str) -> bool:
+    """Validate the common dispatcher claim path while its write txn is held."""
+    return _claim_allowed_locked(conn, task_id, role_dispatch=True)
 
 
 def restricted_role_for_worker(task: Any) -> Optional[str]:
@@ -967,9 +962,26 @@ def _directory_identity(fd: int) -> list[int]:
     return [int(st.st_dev), int(st.st_ino)]
 
 
+def _artifact_platform_supported() -> bool:
+    """The artifact fence requires POSIX dir-fd and no-follow primitives."""
+    required_dir_fd = (os.open, os.mkdir, os.link, os.unlink)
+    return bool(
+        os.name == "posix"
+        and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+        and all(operation in os.supports_dir_fd for operation in required_dir_fd)
+    )
+
+
+def _require_artifact_platform() -> None:
+    if not _artifact_platform_supported():
+        raise ValueError("secure artifact publication is unsupported on this platform")
+
+
 def _open_secure_directory(path: Path) -> tuple[int, list[list[int]]]:
     """Open/create an absolute directory chain and capture every identity."""
-    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    _require_artifact_platform()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     fd = os.open(path.anchor, flags)
     chain = [_directory_identity(fd)]
     try:
@@ -1004,7 +1016,7 @@ def run_artifact_paths(root: Path, board: str, task_id: str, run_id: int) -> dic
         fd, directory_chain = _open_secure_directory(root_path)
     except OSError as exc:
         raise ValueError("artifact root contains a symlink or unsafe component") from exc
-    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     try:
         current = root_path
         for component in components:
@@ -1069,6 +1081,7 @@ def persist_run_artifact_paths(conn, task_id: str, run_id: int, *, board: str, r
 
 
 def finalize_artifacts(paths: dict[str, Any], *, manifest_facts: Optional[dict] = None) -> dict:
+    _require_artifact_platform()
     directory = Path(paths["directory"])
     identities = paths.get("_identity")
     if not isinstance(identities, dict):
@@ -1076,7 +1089,7 @@ def finalize_artifacts(paths: dict[str, Any], *, manifest_facts: Optional[dict] 
     expected_chain = paths.get("_directory_identity")
     if not isinstance(expected_chain, list) or len(expected_chain) != len(directory.parts):
         raise ValueError("prepared artifact directory identity is missing")
-    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     directory_fd = os.open(directory.anchor, flags)
     try:
         for index, expected in enumerate(expected_chain):
@@ -1126,15 +1139,16 @@ def finalize_artifacts(paths: dict[str, Any], *, manifest_facts: Optional[dict] 
                 "sha256": hashlib.sha256(data).hexdigest(),
             }
         manifest = {"artifacts": files, **(manifest_facts or {})}
-        manifest_created = False
+        temp_name = f".manifest.{secrets.token_hex(16)}.tmp"
+        temp_created = False
         try:
             manifest_fd = os.open(
-                "manifest.json",
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                temp_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                 0o600,
                 dir_fd=directory_fd,
             )
-            manifest_created = True
+            temp_created = True
             try:
                 payload = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
                 offset = 0
@@ -1143,11 +1157,25 @@ def finalize_artifacts(paths: dict[str, Any], *, manifest_facts: Optional[dict] 
                 os.fsync(manifest_fd)
             finally:
                 os.close(manifest_fd)
+            os.link(
+                temp_name,
+                "manifest.json",
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            os.unlink(temp_name, dir_fd=directory_fd)
+            temp_created = False
+            os.fsync(directory_fd)
         except BaseException:
-            if manifest_created:
+            if temp_created:
                 try:
-                    os.unlink("manifest.json", dir_fd=directory_fd)
+                    os.unlink(temp_name, dir_fd=directory_fd)
                 except FileNotFoundError:
+                    pass
+                try:
+                    os.fsync(directory_fd)
+                except OSError:
                     pass
             raise
     except OSError as exc:

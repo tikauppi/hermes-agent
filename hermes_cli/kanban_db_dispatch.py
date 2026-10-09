@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import os
 import re
+import select
 import signal
 import sqlite3
 import subprocess
@@ -70,6 +71,42 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
     re.IGNORECASE,
 )
+
+
+@dataclass
+class SpawnedChildIdentity:
+    """Birth-bound handle captured immediately after a lifecycle spawn."""
+
+    pid: int
+    pidfd: Optional[int]
+    process: Any
+
+
+def _capture_spawned_child(raw_spawn: Any) -> SpawnedChildIdentity:
+    """Capture a non-reusable child handle immediately after spawn."""
+    process = raw_spawn if hasattr(raw_spawn, "pid") else None
+    pid = int(getattr(raw_spawn, "pid", raw_spawn) or 0)
+    if pid <= 0:
+        return SpawnedChildIdentity(pid=pid, pidfd=None, process=process)
+    if sys.platform.startswith("linux"):
+        try:
+            stat_line = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            fields = stat_line[stat_line.rindex(")") + 2 :].split()
+            if len(fields) <= 19 or int(fields[1]) != os.getpid():
+                return SpawnedChildIdentity(pid=pid, pidfd=None, process=process)
+            pidfd = os.pidfd_open(pid, 0)
+            return SpawnedChildIdentity(pid=pid, pidfd=pidfd, process=process)
+        except (AttributeError, OSError, ValueError, IndexError):
+            return SpawnedChildIdentity(pid=pid, pidfd=None, process=process)
+    return SpawnedChildIdentity(pid=pid, pidfd=None, process=process)
+
+
+def _close_spawned_child_identity(identity: SpawnedChildIdentity) -> None:
+    if identity.pidfd is not None:
+        try:
+            os.close(identity.pidfd)
+        except OSError:
+            pass
 
 
 @dataclass
@@ -284,6 +321,61 @@ def _sigkill(kill, pid: int) -> bool:
         return False
 
 
+def _poll_pidfd_exit(pidfd: int) -> bool:
+    """Wait briefly for the exact process represented by a Linux pidfd."""
+    for _ in range(10):
+        readable, _, _ = select.select([pidfd], [], [], 0.5)
+        if readable:
+            return True
+    return False
+
+
+def _terminate_spawned_child(identity: SpawnedChildIdentity) -> dict[str, Any]:
+    """Signal only a birth-bound process handle, never a reusable PID number."""
+    info = {
+        "prev_pid": identity.pid,
+        "birth_identity_verified": False,
+        "termination_attempted": False,
+        "terminated": False,
+        "sigkill": False,
+    }
+    if identity.pidfd is not None and hasattr(signal, "pidfd_send_signal"):
+        info["birth_identity_verified"] = True
+        info["termination_attempted"] = True
+        try:
+            signal.pidfd_send_signal(identity.pidfd, signal.SIGTERM)
+        except ProcessLookupError:
+            info["terminated"] = True
+            return info
+        except OSError:
+            return info
+        if _poll_pidfd_exit(identity.pidfd):
+            info["terminated"] = True
+            return info
+        try:
+            signal.pidfd_send_signal(
+                identity.pidfd, getattr(signal, "SIGKILL", signal.SIGTERM)
+            )
+            info["sigkill"] = True
+        except ProcessLookupError:
+            info["terminated"] = True
+            return info
+        except OSError:
+            return info
+        info["terminated"] = _poll_pidfd_exit(identity.pidfd)
+        return info
+    if identity.process is not None and not sys.platform.startswith("linux"):
+        info["birth_identity_verified"] = True
+        info["termination_attempted"] = True
+        try:
+            identity.process.terminate()
+            identity.process.wait(timeout=5)
+            info["terminated"] = True
+        except (OSError, subprocess.SubprocessError, TimeoutError):
+            pass
+    return info
+
+
 def _is_verified_new_child(pid: int) -> bool:
     """Fail closed unless ``pid`` is currently a direct child of this dispatcher."""
     pid = int(pid)
@@ -389,6 +481,33 @@ def _defer_reclaim_for_live_worker(
         payload = {"reason": reason, "claim_lock": claim_lock, "claim_expires_now": grace}
         payload.update(termination)
         _kb._append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
+
+
+def _fence_unverified_spawn(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    pid: int,
+    run_id: Optional[int],
+    claim_lock: Optional[str],
+    reason: str,
+) -> None:
+    """Preserve ownership when a spawned child may still be executing."""
+    with _kb.write_txn(conn):
+        changed = conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind='manual' "
+            "WHERE id=? AND status='running' AND current_run_id IS ? AND claim_lock IS ?",
+            (task_id, run_id, claim_lock),
+        )
+        if changed.rowcount != 1:
+            raise RuntimeError("could not fence an unverifiable spawned child")
+        _kb._append_event(
+            conn,
+            task_id,
+            "spawn_cleanup_manual_investigation",
+            {"pid": int(pid), "reason": reason, "claim_lock": claim_lock},
+            run_id=run_id,
+        )
 
 
 def heartbeat_worker(
@@ -1535,6 +1654,53 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _claim_lifecycle_task_for_dispatch(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    lane: str,
+    ttl_seconds: Optional[int],
+):
+    """Claim an opted-in task only through the dispatch transaction boundary."""
+    from hermes_cli import kanban_theseus_lifecycle as lifecycle
+
+    now = int(time.time())
+    lock = _kb._claimer_id()
+    expires = now + _kb._resolve_claim_ttl_seconds(ttl_seconds)
+    source_status = "review" if lane == "review" else "ready"
+    with _kb.write_txn(conn):
+        if not lifecycle.dispatch_claim_allowed_locked(conn, task_id):
+            _kb._append_event(
+                conn, task_id, "claim_rejected", {"reason": "theseus_lifecycle_gate"}
+            )
+            return None
+        if not _kb._parents_satisfied(conn, task_id):
+            return None
+        if source_status == "ready":
+            _kb._reclaim_dangling_run(
+                conn,
+                task_id,
+                statuses=("ready",),
+                now=now,
+                note="invariant recovery on dispatch claim",
+            )
+        run_id = _kb._claim_and_open_run(
+            conn,
+            task_id,
+            source_status,
+            lock,
+            expires,
+            now,
+            event_extra={"source_status": "review"} if source_status == "review" else None,
+        )
+        if run_id is None:
+            return None
+        lifecycle.bind_claim_authority_locked(conn, task_id, run_id)
+        claimed = _kb.get_task(conn, task_id)
+    _kb._fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
+    return claimed
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -1606,8 +1772,13 @@ def _dispatch_lane_task(
         result.spawned.append((task_id, assignee, ""))
         _count_spawn(assignee)
         return True
-    claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-    with _theseus_lifecycle._role_dispatch_claim_grant():
+    current = _kb.get_task(conn, task_id)
+    if current is not None and current.workflow_template_id == _theseus_lifecycle.WORKFLOW_TEMPLATE_ID:
+        claimed = _claim_lifecycle_task_for_dispatch(
+            conn, task_id, lane=lane, ttl_seconds=ttl_seconds
+        )
+    else:
+        claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
         claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
@@ -1643,17 +1814,19 @@ def _dispatch_lane_task(
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
-        raw_pid = _call_spawn_fn(
+        raw_spawn = _call_spawn_fn(
             spawn_fn if spawn_fn is not None else _default_spawn,
             claimed,
             str(workspace),
             board,
         )
         lifecycle_dispatch = claimed.workflow_template_id == _theseus_lifecycle.WORKFLOW_TEMPLATE_ID
-        pid = int(raw_pid or 0)
+        spawned_child = _capture_spawned_child(raw_spawn) if lifecycle_dispatch else None
+        pid = spawned_child.pid if spawned_child is not None else int(raw_spawn or 0)
         run_id = claimed.current_run_id
         claim_lock = claimed.claim_lock
         if lifecycle_dispatch:
+            assert spawned_child is not None
             if pid <= 0:
                 raise RuntimeError("lifecycle dispatch requires a positive worker PID")
             try:
@@ -1664,18 +1837,43 @@ def _dispatch_lane_task(
                     expected_run_id=run_id,
                     expected_claim_lock=claim_lock,
                 )
-            except Exception:
-                if _is_verified_new_child(pid):
-                    _terminate_reclaimed_worker(pid, claim_lock)
-                raise
+            except Exception as bind_exc:
+                termination = _terminate_spawned_child(spawned_child)
+                if termination.get("terminated"):
+                    _close_spawned_child_identity(spawned_child)
+                    raise
+                _fence_unverified_spawn(
+                    conn,
+                    claimed.id,
+                    pid=pid,
+                    run_id=run_id,
+                    claim_lock=claim_lock,
+                    reason=f"PID bind exception; child cleanup unverified: {bind_exc}",
+                )
+                _close_spawned_child_identity(spawned_child)
+                return False
             if not bound:
-                if _is_verified_new_child(pid):
-                    _terminate_reclaimed_worker(pid, claim_lock)
-                raise RuntimeError("worker PID could not be bound to the exact run and claim")
+                termination = _terminate_spawned_child(spawned_child)
+                if termination.get("terminated"):
+                    _close_spawned_child_identity(spawned_child)
+                    raise RuntimeError(
+                        "worker PID could not be bound to the exact run and claim"
+                    )
+                _fence_unverified_spawn(
+                    conn,
+                    claimed.id,
+                    pid=pid,
+                    run_id=run_id,
+                    claim_lock=claim_lock,
+                    reason="PID bind failed; child cleanup unverified",
+                )
+                _close_spawned_child_identity(spawned_child)
+                return False
+            _close_spawned_child_identity(spawned_child)
         elif pid > 0:
             _set_worker_pid(conn, claimed.id, pid)
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
-        _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), raw_pid, board=board)
+        _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
         # consecutive_failures is deliberately NOT reset here: resetting on
         # spawn would let a task that keeps timing out loop forever. Cleared
         # only on successful completion (complete_task).

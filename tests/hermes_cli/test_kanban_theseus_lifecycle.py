@@ -678,6 +678,8 @@ def test_role_native_claim_rejects_wrong_capability_and_active_peer(lifecycle_db
     assert kb.claim_task(conn, reviewer_id) is None
     assert kb.list_runs(conn, reviewer_id) == []
 
+    assert not hasattr(glh, "_role_dispatch_claim_grant")
+
     reviewer_dispatch = kbd.dispatch_once(
         conn, spawn_fn=lambda *_args, **_kwargs: 49801, max_spawn=1
     )
@@ -778,6 +780,53 @@ def test_artifacts_reject_prepare_finalize_ancestor_replacement_with_hardlinks(l
     assert not (held / "board" / "task-1" / "3" / "manifest.json").exists()
 
 
+def test_artifact_publication_fails_closed_on_unsupported_platform(lifecycle_db, monkeypatch):
+    _conn, tmp_path = lifecycle_db
+    root = tmp_path / "unsupported-runs"
+    monkeypatch.setattr(glh, "_artifact_platform_supported", lambda: False)
+
+    with pytest.raises(ValueError, match="unsupported"):
+        glh.run_artifact_paths(root, "board", "task-1", 39)
+
+    assert not root.exists()
+
+
+def test_artifact_manifest_recovers_around_stale_temp_and_never_replaces_final(lifecycle_db):
+    _conn, tmp_path = lifecycle_db
+    paths = glh.run_artifact_paths(tmp_path / "secure-runs", "board", "task-1", 41)
+    Path(paths["report"]).write_text("report", encoding="utf-8")
+    Path(paths["result"]).write_text("result", encoding="utf-8")
+    stale = Path(paths["directory"]) / ".manifest.crashed.tmp"
+    stale.write_text("partial", encoding="utf-8")
+
+    glh.finalize_artifacts(paths)
+    published = Path(paths["manifest"]).read_bytes()
+    with pytest.raises(ValueError, match="manifest"):
+        glh.finalize_artifacts(paths)
+
+    assert Path(paths["manifest"]).read_bytes() == published
+    assert stale.read_text(encoding="utf-8") == "partial"
+
+
+def test_artifact_manifest_is_not_visible_before_complete_write(lifecycle_db, monkeypatch):
+    _conn, tmp_path = lifecycle_db
+    paths = glh.run_artifact_paths(tmp_path / "secure-runs", "board", "task-1", 40)
+    Path(paths["report"]).write_text("report", encoding="utf-8")
+    Path(paths["result"]).write_text("result", encoding="utf-8")
+    original_write = glh.os.write
+    observed = []
+
+    def observing_write(fd, data):
+        observed.append(Path(paths["manifest"]).exists())
+        return original_write(fd, data)
+
+    monkeypatch.setattr(glh.os, "write", observing_write)
+    glh.finalize_artifacts(paths)
+
+    assert observed and not any(observed)
+    assert json.loads(Path(paths["manifest"]).read_text(encoding="utf-8"))["artifacts"]
+
+
 def test_artifact_manifest_write_failure_removes_partial_file(lifecycle_db, monkeypatch):
     _conn, tmp_path = lifecycle_db
     paths = glh.run_artifact_paths(tmp_path / "secure-runs", "board", "task-1", 4)
@@ -817,15 +866,19 @@ def test_missing_pid_and_pid_bind_failure_are_not_reported_as_spawned(lifecycle_
     )
     terminated = []
     monkeypatch.setattr(kbd, "_set_worker_pid", lambda *_args, **_kwargs: False)
-    monkeypatch.setattr(kbd, "_is_verified_new_child", lambda pid: pid == 49001)
     monkeypatch.setattr(
         kbd,
-        "_terminate_reclaimed_worker",
-        lambda pid, claim_lock: terminated.append((pid, claim_lock)) or {"terminated": True},
+        "_capture_spawned_child",
+        lambda _raw: kbd.SpawnedChildIdentity(pid=49001, pidfd=77, process=None),
+    )
+    monkeypatch.setattr(
+        kbd,
+        "_terminate_spawned_child",
+        lambda identity: terminated.append(identity.pid) or {"terminated": True},
     )
     failed = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 49001)
     assert failed.spawned == []
-    assert terminated and terminated[0][0] == 49001
+    assert terminated == [49001]
 
 
 def test_pid_bind_failure_does_not_kill_unverified_process(lifecycle_db, monkeypatch):
@@ -834,17 +887,58 @@ def test_pid_bind_failure_does_not_kill_unverified_process(lifecycle_db, monkeyp
     glh.record_terminal_approval(conn, task_id, approval_ref="terminal:pid-safe", approved_at=101)
     terminated = []
     monkeypatch.setattr(kbd, "_set_worker_pid", lambda *_args, **_kwargs: False)
-    monkeypatch.setattr(kbd, "_is_verified_new_child", lambda _pid: False)
     monkeypatch.setattr(
         kbd,
-        "_terminate_reclaimed_worker",
-        lambda pid, claim_lock: terminated.append((pid, claim_lock)) or {"terminated": True},
+        "_capture_spawned_child",
+        lambda _raw: kbd.SpawnedChildIdentity(pid=49002, pidfd=None, process=None),
+    )
+    monkeypatch.setattr(
+        kbd,
+        "_terminate_spawned_child",
+        lambda identity: {
+            "prev_pid": identity.pid,
+            "birth_identity_verified": False,
+            "termination_attempted": False,
+            "terminated": False,
+        },
     )
 
     failed = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 49002)
 
     assert failed.spawned == []
     assert terminated == []
+    fenced = kb.get_task(conn, task_id)
+    assert fenced is not None
+    assert fenced.status == "blocked"
+    assert fenced.block_kind == "manual"
+    assert fenced.current_run_id is not None
+    assert [run.id for run in kb.list_runs(conn, task_id) if run.ended_at is None] == [
+        fenced.current_run_id
+    ]
+    retry = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 49022)
+    assert retry.spawned == []
+
+
+def test_spawn_cleanup_uses_birth_handle_instead_of_reusable_pid(monkeypatch):
+    sent = []
+    identity = kbd.SpawnedChildIdentity(pid=49033, pidfd=77, process=None)
+    monkeypatch.setattr(
+        kbd.signal,
+        "pidfd_send_signal",
+        lambda pidfd, sig, _siginfo=None, _flags=0: sent.append((pidfd, sig)),
+        raising=False,
+    )
+    monkeypatch.setattr(kbd, "_poll_pidfd_exit", lambda _pidfd: True)
+    monkeypatch.setattr(
+        kbd.os,
+        "kill",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("numeric PID signal used")),
+    )
+
+    result = kbd._terminate_spawned_child(identity)
+
+    assert result["terminated"]
+    assert sent == [(77, kbd.signal.SIGTERM)]
 
 
 def test_pid_bind_exception_terminates_verified_child_and_preserves_retry_integrity(
@@ -862,22 +956,31 @@ def test_pid_bind_exception_terminates_verified_child_and_preserves_retry_integr
         raise RuntimeError("forced PID bind exception")
 
     monkeypatch.setattr(kbd, "_set_worker_pid", forced_exception)
-    monkeypatch.setattr(kbd, "_is_verified_new_child", lambda pid: pid == 49003)
     monkeypatch.setattr(
         kbd,
-        "_terminate_reclaimed_worker",
-        lambda pid, claim_lock: terminated.append((pid, claim_lock)) or {"terminated": True},
+        "_capture_spawned_child",
+        lambda _raw: kbd.SpawnedChildIdentity(pid=49003, pidfd=78, process=None),
+    )
+    monkeypatch.setattr(
+        kbd,
+        "_terminate_spawned_child",
+        lambda identity: terminated.append(identity.pid) or {"terminated": True},
     )
 
     failed = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 49003)
 
     assert failed.spawned == []
-    assert terminated and terminated[0][0] == 49003
+    assert terminated == [49003]
     failed_task = kb.get_task(conn, task_id)
     assert failed_task is not None and failed_task.worker_pid is None
     assert not [run for run in kb.list_runs(conn, task_id) if run.ended_at is None]
 
     monkeypatch.setattr(kbd, "_set_worker_pid", original_set_worker_pid)
+    monkeypatch.setattr(
+        kbd,
+        "_capture_spawned_child",
+        lambda raw: kbd.SpawnedChildIdentity(pid=int(raw), pidfd=None, process=None),
+    )
     with kb.write_txn(conn):
         conn.execute(
             "UPDATE tasks SET status='blocked', current_step_key=?, block_kind='approval' WHERE id=?",
