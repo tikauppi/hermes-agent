@@ -105,3 +105,79 @@ Pre-evidence snapshot, jonka sisältö nimeää code SHA:n ja tämän evidence-i
 - Ei Gate 2 -hyväksyntää eikä Gate 2 -valmiusväitettä.
 
 R3 CORRECTIONS COMPLETE OR PARTIALLY BLOCKED — AWAITING INDEPENDENT REVIEWER R3
+
+---
+
+# Gateway/Kanban Lifecycle Hardening — R4 implementation results
+
+Tila: `R4_CORRECTIONS_COMPLETE_OR_PARTIALLY_BLOCKED_AWAITING_INDEPENDENT_REVIEWER_R4`
+
+Session: `@session:theseus-builder/20261009_043005_0f4e02`
+
+Tämä osio on Builder-evidenssiä. Se ei ole oma katselmus, Gate 2 -hyväksyntä, merge-lupa eikä live Gateway -aktivointi.
+
+## Commit- ja julkaisuidentiteetti
+
+- R4 base/evidence: `93d90f11c900c7a70597056dac61965c4b4d7108`.
+- R3 code: `3cfc86168ba6560a42fa0696032e150fc231e8c8`.
+- R4 code SHA: `6bcaa640a5b0df3fedc309429ec494e628d10f65`.
+- Branch: `fix/theseus-gateway-kanban-lifecycle-r4`.
+- Fork code readback: `6bcaa640a5b0df3fedc309429ec494e628d10f65` — MATCH.
+- Evidence/docs SHA on tämän osion sisältävän seuraavan commitin SHA; exact arvo todennetaan commitin jälkeen remote-readbackilla.
+- Origin: `https://github.com/NousResearch/hermes-agent.git` — unchanged.
+- Fork: `git@github.com:tikauppi/hermes-agent.git` — unchanged.
+
+## R4-01/02/03/05
+
+| Kohta | Tila | Toteutus / rajaus |
+|---|---|---|
+| R4-01 | `PARTIALLY BLOCKED — ARCHITECT DECISION REQUIRED` | Eristetty Ed25519-verifier ja synteettiset signed fixturet toteutettiin. Signed payload sidotaan expected issuer/key-id/principal/role/type/action/scope/package/task/run/STOP/code-SHA/issued/expiry/nonce-kontekstiin; forged, missing, expired, wrong principal/action/task/run/SHA, replay, revoked, malformed ja concurrent replay hylätään. Oikeaa issueria, production-avainta, trust storea, live-palvelua tai self-issuancea ei toteutettu. Production lifecycle -integraatio jää blokkiin, kunnes Arkkitehti nimeää issuerin, principal-mäppäyksen, trust storen ja atomisen integraatioboundaryn. |
+| R4-02 | IMPLEMENTED / VALIDATED | Julkinen ContextVar-grant poistettiin. Kaikki opt-in lifecycle dispatchit claimaavat yhteisen atomisen dispatcher-transaktion kautta; direct native claim ei saa restricted rolea. Role/profile/read-only/active-peer-säännöt tarkistetaan claim-transaktiossa. Gateway ja standalone käyttävät samaa `dispatch_once`-polkua. |
+| R4-03 | IMPLEMENTED / VALIDATED | Complete ancestor identity fencing säilyy. Manifest syntyy non-final temp-nimeen, data fsyncataan, final julkaistaan atomisella safe no-replace-hardlinkillä verified run-dir FD:n sisällä, temp poistetaan ja hakemisto fsyncataan. Unsupported platform hylätään ennen polun mutaatiota. |
+| R4-05 | IMPLEMENTED / VALIDATED | Linux-spawn capture ottaa pidfd-birth-handlen heti direct-child-varmennuksen jälkeen. Cleanup käyttää pidfd-signaalia eikä PID-numeroa. Unverifiable/surviving child säilyttää `blocked/manual`-tilan sekä aktiivisen run/claim-fencen ja estää dispatch/retryn. |
+
+## Authority contract
+
+- Polku: `planning/gateway-kanban-lifecycle-hardening/authority-contract.md`.
+- SHA-256: `e4dac75c311235901336d14a37cecb0cb527a23c433fdbdb339a29bd0abfa815`.
+- Sopimus määrittää external issuer authorization-, signing/verification-, workerien ulkopuolisen key storage-, canonical schema-, action/type/scope/target/expiry-, nonce/replay/atomic consumption-, revocation/audit-, fail-closed-, rollout/key rotation -ehdot ja erottaa oikean issuerin R4:n synteettisestä test issuerista.
+
+## TDD RED → GREEN
+
+- Verifierin puuttuva moduuli: RED collection exit `1` → valid signed/replay GREEN.
+- Binding/expiry/revocation: RED exit `1` → GREEN; forged/malformed/concurrent replay lisättiin.
+- ContextVar self-grant: RED osoitti `_role_dispatch_claim_grant`-symbolin → symboli ja grant poistettiin, dispatch boundary GREEN.
+- Manifest visibility: RED havaitsi finalin olemassaolon ennen ensimmäistä writea → temp+fsync+atomic no-replace+dir-fsync GREEN.
+- Unverifiable bind: RED palautti taskin `ready`-tilaan → manual fence/retry prevention GREEN.
+- Birth identity: RED puuttuva birth-handle → pidfd-signaalipolku GREEN ilman numeric `os.kill(pid)` -käyttöä.
+
+## Clean exact code SHA -validointi
+
+Testattu SHA: `6bcaa640a5b0df3fedc309429ec494e628d10f65`.
+
+- R4 focused/security/concurrency/interruption: exit `0`; `60 passed, 0 failed` kahdessa tiedostossa.
+- Affected Kanban/Gateway: exit `0`; 84 tiedostoa; `610 passed, 0 failed, 3 skipped`.
+- Kolme Windows-only-testiä: `SKIPPED`, eivät PASS.
+- Synthetic pilot: exit `0`; `1 passed`.
+- Ruff changed Python paths: exit `0`; `All checks passed!`.
+- `git diff --check 93d90f11c900c7a70597056dac61965c4b4d7108..6bcaa640a5b0df3fedc309429ec494e628d10f65`: exit `0`.
+- Third-party scannerit `gitleaks`, `trufflehog`, `detect-secrets`, `semgrep`: `NOT AVAILABLE`, ei PASS.
+- Historiallinen `test_kanban_wake_acceptance.py` 300 s first-attempt timeout säilyy `FLAKY`; R4 exact-SHA runissa 3 testiä PASS.
+
+## Ulkoiset report/result-hashit
+
+- `/opt/data/logs/glh-r4-builder-20261009.report.md`: `85b1cd5fb6e114806d026cb8842126c75587f2ba8a3d0ae50376d04ee85676a5`.
+- `/opt/data/logs/glh-r4-builder-20261009.result.md`: `9f0110c2e746a17a47b608cdfe0f01dd99f09d05d37d7885b7b01b065b7044ab`.
+- R3 reviewer report: `d0af61340aeeb3795f60df823612d9a0516681ad0ff4dc8b031aab4eb2bb6e7b` — MATCH.
+- R3 reviewer result: `696a80d842166db2a4d43bf59445fa669222fa27e39df6924f1155131eaebffb` — MATCH.
+
+## No-live, rollback ja scope
+
+- Live Gateway, production board ja live rollback: `NOT RUN`; mitään ei aktivoitu.
+- Ei tuotantoavainta, production issueria, salaisuutta tai automaattista self-issuancea.
+- Ei S123/S124-, skeema-, migraatio-, taulu- tai `work_packages`-muutosta.
+- Ei mergeä, rebasea, force-pushia, origin-pushia tai remote-URL-muutosta.
+- Rollback on branch/commit-eristys; lifecycle pysyy opt-ininä.
+- Builder ei dispatchaa Reviewer R4:ää eikä myönnä Gate 2:ta.
+
+R4 CORRECTIONS COMPLETE OR PARTIALLY BLOCKED — AWAITING INDEPENDENT REVIEWER R4

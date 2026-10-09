@@ -254,3 +254,86 @@ R3-01:n vuoksi Builder ei väitä Gate 2 -valmiutta.
 - Ei mergeä, rebasea, force-pushia, live-aktivointia, Reviewer-dispatchia tai Gate 2 -päätöstä.
 
 R3 CORRECTIONS COMPLETE OR PARTIALLY BLOCKED — AWAITING INDEPENDENT REVIEWER R3
+
+---
+
+# R4 corrective validation — 2026-10-09
+
+Tila: `R4_CORRECTIONS_COMPLETE_OR_PARTIALLY_BLOCKED_AWAITING_INDEPENDENT_REVIEWER_R4`
+
+Session: `@session:theseus-builder/20261009_043005_0f4e02`
+
+- Base/evidence: `93d90f11c900c7a70597056dac61965c4b4d7108`.
+- R3 code: `3cfc86168ba6560a42fa0696032e150fc231e8c8`.
+- R4 code SHA: `6bcaa640a5b0df3fedc309429ec494e628d10f65`.
+- Fork code readback: MATCH.
+- Evidence/docs SHA: tämän R4-osion ja päivitetyn `implementation-results.md`:n sisältävän seuraavan commitin SHA; exact arvo varmennetaan pushin jälkeisessä remote-readbackissa.
+
+## R4-matriisi
+
+| Kohta | Tila | Validointi |
+|---|---|---|
+| R4-01 | `PARTIALLY BLOCKED — ARCHITECT DECISION REQUIRED` | Eristetty verifier validoi canonical signed evidence -skeeman ja sitoo issuer/key-id/principal/role/type/action/scope/package/task/run/STOP/code SHA/issued/expiry/nonce-arvot expected-kontekstiin. Negatiiviset forged/missing/expired/wrong principal/action/task/run/SHA/replay/revoked/malformed sekä concurrent one-time consumption PASS. Oikea issuer, production trust store ja lifecycle-kirjoituksen atominen integration boundary puuttuvat tarkoituksella ja vaativat Arkkitehdin päätöksen. |
+| R4-02 | PASS | ContextVar self-grant poistettu. Direct native claim, dispatcher route, wrong/missing profile, role policy ja peer concurrency harjoitettiin. Gateway boot ja standalone/Gateway-yhteinen `dispatch_once`-polku säilyivät. R3-04 ei regressioitunut. |
+| R4-03 | PASS Linux/POSIX; Windows `SKIPPED/NOT RUN` | Ancestor replacement, symlink, hardlink collision, final visibility, partial fsync failure, stale-temp recovery, final no-replace ja unsupported-platform fail-closed PASS. Manifest näkyy final-nimellä vasta täydellisen write+file-fsyncin jälkeen ja directory fsync suoritetaan publication jälkeen. |
+| R4-05 | PASS Linux/POSIX | pidfd birth-handle käyttää exact process identityä. Numeric PID signaalipolku hylättiin testissä. Bind False/exception, unverifiable cleanup, manual fence, active run/claim preservation ja retry prevention PASS. |
+| R3-06 | PASS | Kaksi dry-run-tickiä säilyttää DB dumpin ja artifact tree -snapshotin byte-for-byte. |
+
+## Authority contract
+
+- `planning/gateway-kanban-lifecycle-hardening/authority-contract.md`.
+- SHA-256 `e4dac75c311235901336d14a37cecb0cb527a23c433fdbdb339a29bd0abfa815`.
+- Ei oikeaa issueria, production signing keytä, salaisuutta, live-palvelua eikä auto-self-issuancea.
+
+## Exact code SHA -komennot ja exitit
+
+1. Focused R4:
+   - `HERMES_PYTHON=/opt/data/cache/glh-r1-20261009-venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_kanban_authority_verifier.py tests/hermes_cli/test_kanban_theseus_lifecycle.py -q --tb=short -p no:cacheprovider`
+   - exit `0`; `60 passed, 0 failed`.
+2. Affected Kanban/Gateway:
+   - `HERMES_PYTHON=/opt/data/cache/glh-r1-20261009-venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_kanban*.py tests/gateway/test_kanban*.py tests/plugins/test_kanban*.py tests/tools/test_kanban*.py tests/agent/test_kanban*.py tests/tui_gateway/test_kanban*.py -q --tb=short -p no:cacheprovider`
+   - exit `0`; 84 tiedostoa; `610 passed, 0 failed, 3 skipped`.
+   - Kolme Windows-only-testiä: `SKIPPED`, eivät PASS.
+3. Synthetic pilot:
+   - sama canonical runner, selector `isolated_pilot_uses_synthetic_subprocess_and_run_readback`.
+   - exit `0`; `1 passed`.
+4. Ruff:
+   - changed Python paths, `--no-cache`.
+   - exit `0`; `All checks passed!`.
+5. Diff:
+   - `git diff --check 93d90f11c900c7a70597056dac61965c4b4d7108..6bcaa640a5b0df3fedc309429ec494e628d10f65`.
+   - exit `0`.
+6. Secret scanner availability:
+   - `gitleaks`, `trufflehog`, `detect-secrets`, `semgrep`: `NOT AVAILABLE`.
+   - Ei scanner-PASS-väitettä.
+
+## Synthetic evidence
+
+- Synteettinen Ed25519 private key generoidaan vain testissä eikä sitä tallenneta tuotantoasetukseen, repoon tai worker-ympäristöön.
+- Verifierin positiivinen fixture käyttää synteettisiä issuer-, key-id-, principal-, package-, task-, run-, STOP- ja nonce-arvoja.
+- Concurrent consume-once -testissä täsmälleen 1/16 yrityksestä hyväksyttiin ja 15/16 hylättiin replayna.
+- Synthetic lifecycle pilot käytti disposable SQLite-kantaa, temporary worktree -polkuja ja synteettistä aliprosessia; live Gatewayta tai production boardia ei käytetty.
+
+## Flake, skips, blockerit ja report/result
+
+- Historiallinen `tests/gateway/test_kanban_wake_acceptance.py` 300 s first-attempt timeout säilyy `FLAKY`; current R4 exact-SHA run: 3 PASS.
+- Windows-only: 3 `SKIPPED`; Windows artifact runtime `NOT RUN` tällä Linux-hostilla. Unsupported-platform-politiikka testattiin fail-closed pure boundaryna ilman host-OS:n feikkausta.
+- R4-01 production issuer/integration: `PARTIALLY BLOCKED — ARCHITECT DECISION REQUIRED`.
+- Muut R4-02/03/05: IMPLEMENTED / VALIDATED.
+- Builder report SHA-256: `85b1cd5fb6e114806d026cb8842126c75587f2ba8a3d0ae50376d04ee85676a5`.
+- Builder result SHA-256: `9f0110c2e746a17a47b608cdfe0f01dd99f09d05d37d7885b7b01b065b7044ab`.
+- R3 reviewer report SHA-256: `d0af61340aeeb3795f60df823612d9a0516681ad0ff4dc8b031aab4eb2bb6e7b` — MATCH.
+- R3 reviewer result SHA-256: `696a80d842166db2a4d43bf59445fa669222fa27e39df6924f1155131eaebffb` — MATCH.
+
+## No-live, rollback ja origin
+
+- Live Gateway: `NOT RUN`; ei käynnistetty, pysäytetty tai aktivoitu.
+- Production board: `NOT RUN`; ei käytetty.
+- Live rollback: `NOT RUN`; rollback on branch/commit-eristys ja opt-in lifecycle.
+- Origin säilyi `https://github.com/NousResearch/hermes-agent.git` eikä originia pushattu.
+- Fork säilyi `git@github.com:tikauppi/hermes-agent.git`.
+- Ei S123/S124-, migraatio-, taulu-, `work_packages`-, merge-, rebase-, force-push-, Gate 2- tai Reviewer-dispatch-muutosta.
+
+Builder pysähtyy riippumattomaan Reviewer R4 -katselmukseen.
+
+R4 CORRECTIONS COMPLETE OR PARTIALLY BLOCKED — AWAITING INDEPENDENT REVIEWER R4
