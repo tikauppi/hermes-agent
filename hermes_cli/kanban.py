@@ -1242,8 +1242,7 @@ def _cmd_lifecycle(args: argparse.Namespace) -> int:
             approved = glh.record_terminal_approval(
                 conn,
                 args.task_id,
-                approval_ref=args.approval_ref,
-                approved_at=args.approved_at,
+                authority_evidence=args.authority_evidence,
             )
             result = {"approved": approved, "task_id": args.task_id}
     if _json_out(args, result):

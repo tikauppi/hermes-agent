@@ -57,6 +57,11 @@ def _fixture(payload: dict | None = None, *, revoked_nonces: set[str] | None = N
     public_key = private_key.public_key().public_bytes_raw()
     verifier = AuthorityVerifier(
         trusted_keys={(PAYLOAD["issuer"], PAYLOAD["key_id"]): public_key},
+        authorized_principals={
+            (PAYLOAD["issuer"], PAYLOAD["principal"]): frozenset(
+                {PAYLOAD["principal_role"]}
+            )
+        },
         revoked_nonces=revoked_nonces or set(),
     )
     return verifier, _expected(), envelope, private_key
@@ -154,6 +159,69 @@ def test_missing_expired_and_revoked_evidence_fail_closed():
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("version", True),
+        ("issued_at", False),
+        ("expires_at", True),
+    ],
+)
+def test_json_boolean_is_not_an_integer_authority_field(field, bad_value):
+    payload = dict(PAYLOAD)
+    payload[field] = bad_value
+    verifier, _expected_original, envelope, _ = _fixture(payload)
+    expected = AuthorityExpectation(
+        **{key: payload[key] for key in AuthorityExpectation.__dataclass_fields__}
+    )
+
+    with pytest.raises(AuthorityEvidenceRejected, match="malformed"):
+        verifier.verify_and_consume(
+            envelope,
+            expected=expected,
+            now=0 if field == "expires_at" else 1_050,
+            consume_once=lambda *_args: True,
+        )
+
+
+def test_evidence_is_expired_at_the_exact_expiry_boundary():
+    verifier, expected, envelope, _ = _fixture()
+
+    with pytest.raises(AuthorityEvidenceRejected, match="expired"):
+        verifier.verify_and_consume(
+            envelope,
+            expected=expected,
+            now=PAYLOAD["expires_at"],
+            consume_once=lambda *_args: True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("version", -1),
+        ("issued_at", -1),
+        ("expires_at", 2**63),
+        ("run_id", -1),
+    ],
+)
+def test_integer_authority_fields_require_safe_ranges(field, bad_value):
+    payload = dict(PAYLOAD)
+    payload[field] = bad_value
+    verifier, _expected_original, envelope, _ = _fixture(payload)
+    expected = AuthorityExpectation(
+        **{key: payload[key] for key in AuthorityExpectation.__dataclass_fields__}
+    )
+
+    with pytest.raises(AuthorityEvidenceRejected, match="malformed"):
+        verifier.verify_and_consume(
+            envelope,
+            expected=expected,
+            now=1_050,
+            consume_once=lambda *_args: True,
+        )
+
+
 def test_forged_and_malformed_evidence_fail_closed():
     verifier, expected, envelope, _ = _fixture()
     forged = json.loads(envelope)
@@ -169,6 +237,65 @@ def test_forged_and_malformed_evidence_fail_closed():
     with pytest.raises(AuthorityEvidenceRejected):
         verifier.verify_and_consume(
             '{"payload":',
+            expected=expected,
+            now=1_050,
+            consume_once=lambda *_args: True,
+        )
+
+
+def test_trusted_key_does_not_authorize_an_unknown_principal():
+    _verifier, expected, envelope, private_key = _fixture()
+    unauthorized = AuthorityVerifier(
+        trusted_keys={
+            (PAYLOAD["issuer"], PAYLOAD["key_id"]): private_key.public_key().public_bytes_raw()
+        },
+        authorized_principals={},
+    )
+
+    with pytest.raises(AuthorityEvidenceRejected, match="authorization"):
+        unauthorized.verify_and_consume(
+            envelope,
+            expected=expected,
+            now=1_050,
+            consume_once=lambda *_args: True,
+        )
+
+
+@pytest.mark.parametrize("revocation", ["issuer", "key"])
+def test_revoked_issuer_or_key_is_rejected(revocation):
+    _verifier, expected, envelope, private_key = _fixture()
+    kwargs = {
+        "trusted_keys": {
+            (PAYLOAD["issuer"], PAYLOAD["key_id"]): private_key.public_key().public_bytes_raw()
+        },
+        "authorized_principals": {
+            (PAYLOAD["issuer"], PAYLOAD["principal"]): frozenset({PAYLOAD["principal_role"]})
+        },
+        "revoked_issuers": {PAYLOAD["issuer"]} if revocation == "issuer" else set(),
+        "revoked_keys": {
+            (PAYLOAD["issuer"], PAYLOAD["key_id"])
+        } if revocation == "key" else set(),
+    }
+
+    with pytest.raises(AuthorityEvidenceRejected, match="revoked"):
+        AuthorityVerifier(**kwargs).verify_and_consume(
+            envelope,
+            expected=expected,
+            now=1_050,
+            consume_once=lambda *_args: True,
+        )
+
+
+def test_unknown_issuer_is_rejected():
+    _verifier, expected, envelope, _private_key = _fixture()
+    unknown = AuthorityVerifier(
+        trusted_keys={},
+        authorized_principals={},
+    )
+
+    with pytest.raises(AuthorityEvidenceRejected, match="signature"):
+        unknown.verify_and_consume(
+            envelope,
             expected=expected,
             now=1_050,
             consume_once=lambda *_args: True,

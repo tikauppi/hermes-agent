@@ -1,61 +1,104 @@
-# Gateway/Kanban Lifecycle Hardening — auktoriteettisopimus
+# Gateway/Kanban Lifecycle Hardening — auktoriteettisopimus R5
 
-Tila: R4:n eristetyn verifierin sopimus. Tämä asiakirja ei nimeä eikä toteuta tuotannon issuedia, avainhallintaa tai live-palvelua eikä myönnä Gate 2:ta.
+Tila: `BLOCKED — PRODUCTION AUTHORITY NOT AVAILABLE`
 
-## 1. Luottamusraja ja ulkoinen issuer
+Tämä sopimus erottaa toteutetun turvarajan, synteettisellä issuerilla testatun käyttäytymisen ja puuttuvan tuotantoauktoriteetin. Synteettinen onnistuminen ei ole tuotantoauktoriteetin onnistuminen. Asiakirja ei myönnä Gate 2:ta, merge-lupaa eikä live Gateway -aktivointia.
 
-Terminal approval- ja Architect decision -valtuutus syntyy Hermes-workerin ulkopuolisessa, Arkkitehdin erikseen hyväksymässä issuer-palvelussa. Issuer tunnistaa käyttäjän server-side-menetelmällä, ratkaisee varmennetun principalin hyväksyttyyn rooliin ja tarkistaa ennen allekirjoitusta, että principal saa suorittaa pyydetyn toiminnon täsmälleen nimetylle kohteelle.
+## 1. IMPLEMENTED
 
-Hermes-worker, CLI-argumentti, Gateway-viesti, ympäristömuuttuja, profiilinimi, `ContextVar`, caller-supplied actor/ref/aika tai Kanban-eventti ei saa yksin luoda valtuutusta. Hermes vain varmentaa ulkoisen issuerin allekirjoittaman evidenssin ja kuluttaa sen atomisesti kohdeoperaation yhteydessä.
+### Yhteinen pakollinen mutaatioraja
 
-## 2. Allekirjoitus ja varmennus
+Terminal approval, fresh approval, Architect resume ja Investigator-luontiin liittyvä Architect-päätös kulkevat saman `_authority_gate_locked`-rajan kautta varsinaisessa SQLite-write-transaktiossa. CLI ja Gatewayn `/kanban` käyttävät samaa `run_slash`- ja lifecycle-polkuja. Pythonin suora lifecycle-kutsu ei saa erillistä poikkeusta. Yleinen `_transition` ei saa siirtää approval- tai Architect-päätöstä vaativaa vaihetta `READY_FOR_BUILDER`-tilaan.
 
-Issuer allekirjoittaa kanonisoidun evidenssipayloadin hyväksytyllä epäsymmetrisellä algoritmilla. Verifier käyttää vain ennalta luotettua issuer-tunnisteen ja julkisen varmennusavaimen sidontaa. Tuntematon issuer, tuntematon avain-id, väärä algoritmi, väärä allekirjoitus, epäkanoninen tai virheellinen payload ja ylimääräinen tai puuttuva kenttä hylätään fail-closed-periaatteella.
+Caller-supplied `actor`, `approval_ref`, `approved_at`, `decision_ref`, muu metadata, ympäristömuuttuja, profiili tai `ContextVar` ei muodosta auktoriteettia. Niillä ei voi korjata allekirjoituksen, issuer-valtuutuksen tai sidonnan virhettä.
 
-Tuotannon yksityinen allekirjoitusavain säilytetään Hermes-workereiden, Kanban-tietokannan, työpuiden, lokien ja ympäristömuuttujien ulkopuolella. Workerille jaetaan vain varmennukseen tarvittava julkinen avain tai luotettu avainrekisteri. Avaimen materiaalia ei kirjoiteta task-eventteihin.
+### Evidenssi ja päätösidentiteetti
 
-## 3. Kanoninen allekirjoitettu evidenssi
+Hyväksyttävä evidenssi on ulkoisen issuerin Ed25519-allekirjoittama canonical JSON. Payload sisältää täsmälleen version, algoritmin, issuerin, key-id:n, varmennetun principalin ja roolin, evidenssityypin, actionin, scopen, package-id:n, task-id:n, run-id:n, STOP-tokenin, code SHA:n, issued-at-ajan, expires-at-ajan ja noncen.
 
-Kanoninen payload on UTF-8-koodattu JSON, jossa objektien avaimet järjestetään deterministisesti, turha välilyönti poistetaan, duplikaattiavaimet kielletään ja arvotyypit validoidaan. Allekirjoituksen kattama skeema sisältää täsmälleen:
+Verifier tarkistaa:
 
-- version ja allekirjoitusalgoritmin;
-- issuerin ja key-id:n;
-- varmennetun principalin sekä principalin roolin;
-- actionin ja evidenssin tyypin;
-- scopen;
-- targetin: package-id ja task-id;
-- run-id:n sekä terminal approvalissa hyväksyttävän run-scope-arvon tai Architect decisionissa täsmällisen pysäytetyn run-id:n;
-- STOP-tokenin, kun action on Architect resume;
-- code/candidate SHA:n;
-- issued-at- ja expiry-ajan;
-- kryptografisesti satunnaisen nonce-arvon.
+- issuer/key-id-parin ennalta luotetusta julkisesta avainkartasta;
+- principalin ja roolin issuer-kohtaisesta authorization-kartasta;
+- Ed25519-allekirjoituksen;
+- decision type-, action-, scope-, package-, task-, run-, STOP- ja code-SHA-sidonnat erikseen muodostettuun odotettuun kontekstiin;
+- exact kenttäjoukon, duplikaattiavainten kiellon ja canonical allekirjoitussisällön;
+- `version`, `run_id`, `issued_at` ja `expires_at` genuine JSON integer -tyyppeinä: `bool` ei kelpaa ja sallittu alue on `0 <= value < 2^63`;
+- aikajärjestyksen `issued_at <= now < expires_at` ja `issued_at < expires_at`;
+- issuer-, key- ja nonce-revokaation;
+- replay-suojan.
 
-Action, type, scope, target, run/STOP-token ja code SHA verrataan verifierille erikseen annettuun odotettuun päätöskontekstiin. Payload ei saa määrätä omaa odotettua kontekstiaan.
+Tuntematon issuer/key-id, valtuuttamaton principal/rooli, väärä scope/action/type/target/run/STOP/SHA, forged tai malformed allekirjoitus, puuttuva tai ylimääräinen kenttä, bool integer-kentässä, turvarajan ulkopuolinen integer, tuleva issued-at, `now >= expires_at`, revokaatio ja replay hylätään fail-closed.
 
-## 4. Nonce, replay-suoja ja atominen kulutus
+### Atominen kulutus, tilasiirtymä ja audit
 
-Nonce on issuerin luoma kertakäyttöinen tunniste. Verifier tarkistaa allekirjoituksen, kaikki sidonnat, voimassaoloajan ja revokaation ennen hyväksyntää. Hyväksytty nonce kulutetaan samassa tietokantatransaktiossa kuin terminal approval- tai resume-tilasiirtymä. Kulutus kirjataan olemassa olevaan audit/event-rakenteeseen; uutta globaalia skeemaa tai taulua ei oleteta tässä R4:ssa. Sama nonce, sama allekirjoitus tai sama päätösevidenssi hylätään kaikissa myöhemmissä yrityksissä, myös rinnakkaisissa kutsuissa.
+Hyväksytyn evidenssin `(issuer, nonce)` tarkistus ja `theseus_authority_consumed`-audit-event, varsinainen task-tilasiirtymä sekä approval/decision-audit-event tehdään samassa `BEGIN IMMEDIATE` -write-transaktiossa. Jos sidonta, kulutus, CAS-tilasiirtymä tai auditointi epäonnistuu, transaktio perutaan eikä hyväksyntä, resume, Investigator-task tai worker-run synny.
 
-Jos turvallista atomista kulutusta ei voida toteuttaa olemassa olevilla rakenteilla, tuotantointegraatio pysyy tilassa `BLOCKED — ARCHITECT DECISION REQUIRED` eikä verifierin positiivista tulosta saa käyttää tilasiirtymään.
+Audit sisältää vähintään issuerin, noncen, evidenssidigestin, actionin, scopen, principalin päätöstapahtumassa sekä target/run/STOP-sidonnan päätöstapahtumassa. Yksityistä avainta tai muuta allekirjoitussalaisuutta ei tallenneta.
 
-## 5. Revokaatio ja auditointi
+Toteutus käyttää nykyisiä `task_events`- ja task-rakenteita. Se ei lisää skeemaa, taulua tai migraatiota.
 
-Issuer tai erillinen Arkkitehdin hyväksymä revokaatiolähde voi peruuttaa avaimen, issuerin tai yksittäisen noncen. Verifier hylkää revokoidun kohteen ennen kulutusta. Audit-tietueeseen tallennetaan vähintään payloadin tiiviste, issuer, key-id, principal, action, target, run/STOP-sidonta, code SHA, issued-at, expiry, nonce, varmennustulos, hylkäyssyy ja kulutuksen tulos. Salaisuuksia tai yksityistä avainmateriaalia ei tallenneta.
+## 2. TESTED WITH SYNTHETIC ISSUER
 
-Revokaatiolähteen saavuttamattomuuden politiikka on fail-closed, ellei Arkkitehti hyväksy erillistä, rajattua offline-politiikkaa. R4 ei ota käyttöön offline-poikkeusta.
+Testit generoivat prosessin sisäisen disposable Ed25519-avaimen ja injektoivat `SyntheticAuthorityTestConfiguration`-olion vain eksplisiittisellä `_test_authority`-parametrilla. CLI- ja Gateway-polut eivät välitä tätä parametria ja hylkäävät synteettisen evidenssin tuotantopolkuna.
 
-## 6. Fail-closed-semanttiikka
+Synteettisellä issuerilla on testattu:
 
-Puuttuva, vanhentunut, tulevaisuuteen päivätty, malformed, forged, väärälle principalille/actionille/tyypille/scopelle/taskille/package-id:lle/runille/STOP-tokenille/SHA:lle allekirjoitettu, replayattu tai revokoitu evidenssi hylätään. Kellon, avainrekisterin, revokaatiolähteen, kryptokirjaston, tietokannan tai atomisen kulutuksen virhe hylkää operaation. Hylkäys ei avaa taskia, luo runia, vapauta STOP-tilaa eikä käynnistä workeria.
+- validi approval, fresh approval, Architect resume ja Investigator-päätös;
+- issuer authorization sekä approver/architect-roolisidonta;
+- allekirjoitus, action, type, scope, package, task, run, STOP-token ja code SHA;
+- malformed-, missing-, bool-integer- ja safe-range-tapaukset;
+- expiry-raja `now == expires_at`;
+- unknown issuer, valtuuttamaton principal, revoked issuer/key/nonce ja forged signature;
+- replay sekä samanaikaiset yritykset, joista vain yksi saa atomisen kulutuksen ja tilasiirtymän;
+- caller-metadatan kyvyttömyys korjata väärää allekirjoitettua scopea;
+- CLI-, Gatewayn yhteisen slash-polun, Python native -kutsun ja suoran lifecycle-mutaation fail-closed-käyttäytyminen.
 
-## 7. Rollout ja avainkierto
+Synteettinen private key on vain testikoodissa. Sitä ei toimiteta konfiguraationa, trust storena, issuer-palveluna, ympäristömuuttujana tai live Gatewayn käyttöön. Synteettiset principalit eivät ole tuotantoidentiteettejä.
 
-Tuotantorollout vaatii erillisen Architect-päätöksen issuerista, authentication- ja role-mäppäyksestä, avainrekisterin omistajasta, revokaatiosta, retentionista, valvonnasta, failure-politiikasta ja integraatioboundarysta. Rollout tehdään ensin pois päältä olevalla verifierillä, sitten synteettisillä testivektoreilla, rajatulla canarylla ja vasta erillisen hyväksynnän jälkeen live-käyttöön.
+## 3. BLOCKED — PRODUCTION AUTHORITY NOT AVAILABLE
 
-Avainkierrossa issuer julkaisee uuden key-id:n ja julkisen avaimen ennen käyttöönottoa. Vanha ja uusi varmennusavain voivat olla rajatun overlap-ajan luotettuja, mutta allekirjoitus valitsee yksikäsitteisen key-id:n. Kompromettoitu avain revokoidaan välittömästi; sen aiemmin käyttämättömät evidenssit hylätään. Yksityisiä avaimia ei kopioida Hermes-workereihin kierrossakaan.
+Tuotantoon ei ole konfiguroitu eikä tässä R5:ssä luotu:
 
-## 8. R4:n synteettinen test issuer
+1. server-side authenticated päätösidentiteettiä;
+2. Arkkitehdin hyväksymää production issueria;
+3. issuerin authorization- ja principal/role-mäppäystä;
+4. production signing key -hallintaa;
+5. luotettua julkisten avainten jakelua tai trust storea;
+6. authoritative issuer/key/nonce-revokaatiolähdettä ja sen availability-politiikkaa;
+7. boardit ylittävää authoritative receipt storea;
+8. rollout-, valvonta-, retention- ja incident response -päätöksiä.
 
-R4 toteuttaa vain eristetyn verifier-komponentin ja testien sisäisen synteettisen issuerin/fixturet. Synteettinen yksityinen avain luodaan testissä, sitä ei toimiteta tuotantoasetuksena, palveluna, salaisuutena tai automaattisena self-issuance-polkuina. Synteettinen issuer ei ole oikea issuer, sen principalit eivät ole tuotantoidentiteettejä eikä sen allekirjoitus valtuuta live Gatewayta, tuotantoboardia tai todellista päätöstä.
+Siksi jokainen tuotannon approval-, fresh approval-, Architect resume- ja Investigator authorization -kirjoitus päättyy täsmälliseen tilaan:
 
-Oikea issuer jää Arkkitehdin erikseen nimettäväksi ja toteutettavaksi. R4-verifierin API ei saa kätkeä tätä eroa eikä hyväksyä caller-controlled avainta luottamusankkuriksi.
+`BLOCKED — TRUSTED AUTHORITY NOT CONFIGURED`
+
+Tämä koskee CLI:tä, Gatewayn `/kanban`-polkua, Python native -kutsuja ja suoria lifecycle-funktioita. Profiili, env, `ContextVar`, caller-ref, caller-aika tai actor-merkkijono ei poista blokkia.
+
+### Rajattu Architect-muutosesitys
+
+Tuotantoblokin poistaminen vaatii erillisen Architect-päätöksen ja uuden rajatun toteutusluvan seuraaville asioille:
+
+- nimetä authenticated identity provider ja production issuer;
+- määrittää issuerin principal/role-authorization;
+- valita signing key -säilytys, key rotation ja julkisen avaimen luotettu jakelu;
+- valita authoritative revocation- ja receipt store sekä availability/fail-closed-politiikka;
+- ratkaista eri Kanban-boardien välinen kertakäyttöisyys. Jos se vaatii uuden globaalin mallin, taulun tai skeeman, sitä ei lisätä ilman nimenomaista lupaa;
+- toteuttaa production-only configuration loader, joka ei hyväksy testikonfiguraatiota;
+- tehdä canary-rollout erillisellä luvalla ja riippumattomalla katselmuksella.
+
+Nykyinen R5 ei toteuta tai aktivoi näitä riippuvuuksia.
+
+## 4. Allekirjoitusavainten hallintaraja
+
+Production private key kuuluu issuer-palvelun hallintaan Hermes-workerien, Kanban-tietokantojen, työpuiden, lokien, testifixtureiden ja ympäristömuuttujien ulkopuolelle. Hermes saa vain varmennukseen tarvittavan luotetun julkisen avainmateriaalin. Key-id on yksikäsitteinen issuerin sisällä. Kompromettoitu issuer tai key-id revokoidaan authoritative lähteessä ennen uuden evidenssin hyväksyntää.
+
+## 5. Revokaatio ja fail-closed
+
+Issuer-, key- ja nonce-revokaatio tarkistetaan ennen receipt-kulutusta. Tuotannon revokaatiolähteen puuttuminen tai saavuttamattomuus estää operaation. Offline-poikkeusta ei ole hyväksytty. Kryptokirjaston, trust storen, revokaation, kellon, SQLite-transaktion, CAS-päivityksen tai auditoinnin virhe estää tilasiirtymän.
+
+## 6. Rollout ja rollback
+
+Rollout-riippuvuudet ovat Architect-päätös, production issuer/trust-store/revocation/receipt-store, turvallinen avainjakelu, monitorointi, canary ja riippumaton Reviewer. Ennen niiden täyttymistä ominaisuus jää blokkiin eikä live Gatewayta aktivoida.
+
+Rollback on fail-closed: production authority -konfiguraatio poistetaan käytöstä, uudet auktoriteettikirjoitukset palaavat täsmälliseen blocked-tilaan ja jo kirjoitetut audit-eventit säilytetään. Rollback ei poista tai uudelleenkäytä nonceja, ei alenna scope-/signature-tarkistuksia eikä muuta historiallista evidenssiä.

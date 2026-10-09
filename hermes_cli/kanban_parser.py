@@ -138,10 +138,13 @@ _LIFECYCLE_SPECS = [
     _cmd("show", [_TASK_ID, _json_flag()], help="Read back an opt-in THESEUS lifecycle task"),
     _cmd("approve", [
         _TASK_ID,
-        _arg("--approval-ref", required=True, help="Immutable terminal approval receipt/reference"),
-        _arg("--approved-at", required=True, type=int, help="Approval receipt epoch timestamp"),
+        _arg(
+            "--authority-evidence",
+            required=True,
+            help="Externally issued signed authority evidence JSON",
+        ),
         _json_flag(),
-    ], help="Approve a pre-dispatch task without bypassing its expiry"),
+    ], help="Submit signed authority evidence (production remains blocked until configured)"),
 ]
 
 # Top-level ``hermes kanban <action>`` records, in ``--help`` order.

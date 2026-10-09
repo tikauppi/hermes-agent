@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import inspect
+import base64
+import itertools
 import json
 import os
 import subprocess
@@ -9,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 import model_tools
 from hermes_cli import kanban_db as kb
@@ -16,6 +19,141 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_theseus_lifecycle as glh
+from hermes_cli.kanban_authority_verifier import AuthorityVerifier
+
+
+_TEST_AUTHORITY_KEY = Ed25519PrivateKey.generate()
+_TEST_AUTHORITY_ISSUER = "synthetic-r5-lifecycle-issuer"
+_TEST_AUTHORITY_KEY_ID = "synthetic-r5-key-1"
+_TEST_APPROVER = "synthetic-r5-approver"
+_TEST_ARCHITECT = "synthetic-r5-architect"
+_TEST_NONCES = itertools.count(1)
+_TEST_AUTHORITY = glh.SyntheticAuthorityTestConfiguration(
+    AuthorityVerifier(
+        trusted_keys={
+            (_TEST_AUTHORITY_ISSUER, _TEST_AUTHORITY_KEY_ID):
+                _TEST_AUTHORITY_KEY.public_key().public_bytes_raw()
+        },
+        authorized_principals={
+            (_TEST_AUTHORITY_ISSUER, _TEST_APPROVER): frozenset({"approver"}),
+            (_TEST_AUTHORITY_ISSUER, _TEST_ARCHITECT): frozenset({"architect"}),
+        },
+    )
+)
+
+
+def _signed_authority(
+    conn,
+    task_id: str,
+    *,
+    action: str,
+    evidence_type: str,
+    principal: str,
+    principal_role: str,
+    run_id: int = 0,
+    stop_token: str = "none",
+    issued_at: int = 100,
+    expires_at: int = 150,
+    overrides: dict | None = None,
+) -> str:
+    metadata = glh.package_metadata(conn, task_id)
+    assert metadata is not None
+    payload = {
+        "version": 1,
+        "algorithm": "Ed25519",
+        "issuer": _TEST_AUTHORITY_ISSUER,
+        "key_id": _TEST_AUTHORITY_KEY_ID,
+        "principal": principal,
+        "principal_role": principal_role,
+        "evidence_type": evidence_type,
+        "action": action,
+        "scope": glh.AUTHORITY_SCOPE,
+        "package_id": metadata["package_id"],
+        "task_id": task_id,
+        "run_id": run_id,
+        "stop_token": stop_token,
+        "code_sha": metadata["candidate_sha"],
+        "issued_at": issued_at,
+        "expires_at": expires_at,
+        "nonce": f"synthetic-r5-{next(_TEST_NONCES):08d}",
+    }
+    payload.update(overrides or {})
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
+    return json.dumps(
+        {
+            "payload": payload,
+            "signature": base64.b64encode(_TEST_AUTHORITY_KEY.sign(canonical)).decode("ascii"),
+        },
+        sort_keys=True,
+    )
+
+
+def _approve(conn, task_id: str, *, expires_at: int = 150, evidence: str | None = None):
+    evidence = evidence or _signed_authority(
+        conn,
+        task_id,
+        action="record_terminal_approval",
+        evidence_type="terminal_approval",
+        principal=_TEST_APPROVER,
+        principal_role="approver",
+        expires_at=expires_at,
+    )
+    return glh._record_terminal_approval_for_test(
+        conn, task_id, authority_evidence=evidence, test_authority=_TEST_AUTHORITY
+    )
+
+
+def _fresh_approve(conn, task_id: str, *, expires_at: int = 200):
+    evidence = _signed_authority(
+        conn,
+        task_id,
+        action="issue_fresh_terminal_approval",
+        evidence_type="terminal_approval",
+        principal=_TEST_APPROVER,
+        principal_role="approver",
+        expires_at=expires_at,
+    )
+    return glh._issue_fresh_terminal_approval_for_test(
+        conn, task_id, authority_evidence=evidence, test_authority=_TEST_AUTHORITY
+    )
+
+
+def _resume(conn, task_id: str, *, evidence: str | None = None):
+    stop = glh._event_payload(conn, task_id, "theseus_architect_stop")
+    assert stop is not None
+    evidence = evidence or _signed_authority(
+        conn,
+        task_id,
+        action="resume_after_architect_decision",
+        evidence_type="architect_decision",
+        principal=_TEST_ARCHITECT,
+        principal_role="architect",
+        run_id=int(stop["stopped_run_id"]),
+        stop_token=stop["stop_token"],
+    )
+    return glh._resume_after_architect_decision_for_test(
+        conn, task_id, authority_evidence=evidence, test_authority=_TEST_AUTHORITY
+    )
+
+
+def _create_role_task(conn, **kwargs):
+    if kwargs.get("role") == "investigator":
+        builder_task_id = kwargs["builder_task_id"]
+        evidence = _signed_authority(
+            conn,
+            builder_task_id,
+            action="create_investigator_task",
+            evidence_type="architect_decision",
+            principal=_TEST_ARCHITECT,
+            principal_role="architect",
+        )
+        kwargs["authority_evidence"] = evidence
+        kwargs["test_authority"] = _TEST_AUTHORITY
+        kwargs.pop("authorization_ref", None)
+        return glh._create_role_task_for_test(conn, **kwargs)
+    return glh.create_role_task(conn, **kwargs)
 
 
 @pytest.fixture
@@ -69,6 +207,179 @@ def _builder(conn, tmp_path: Path, *, expires_at: int = 200):
     )
 
 
+def test_production_authority_is_blocked_without_trusted_configuration(lifecycle_db):
+    conn, tmp_path = lifecycle_db
+    task_id = _builder(conn, tmp_path)
+
+    with pytest.raises(
+        ValueError,
+        match="^BLOCKED — TRUSTED AUTHORITY NOT CONFIGURED$",
+    ):
+        glh.record_terminal_approval(
+            conn,
+            task_id,
+            approval_ref="caller-controlled",
+            approved_at=110,
+        )
+
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.current_step_key == glh.AWAITING_TERMINAL_APPROVAL
+    assert not any(
+        event.kind == "theseus_terminal_approved"
+        for event in kb.list_events(conn, task_id)
+    )
+
+
+def test_cli_and_gateway_shared_slash_path_reject_caller_metadata(lifecycle_db):
+    conn, tmp_path = lifecycle_db
+    task_id = _builder(conn, tmp_path)
+
+    output = kc.run_slash(
+        f"lifecycle approve {task_id} --authority-evidence forged --json"
+    )
+
+    assert "BLOCKED — TRUSTED AUTHORITY NOT CONFIGURED" in output
+    assert kb.get_task(conn, task_id).status == "blocked"
+
+
+def test_public_lifecycle_rejects_synthetic_test_configuration(lifecycle_db):
+    conn, tmp_path = lifecycle_db
+    task_id = _builder(conn, tmp_path)
+    evidence = _signed_authority(
+        conn,
+        task_id,
+        action="record_terminal_approval",
+        evidence_type="terminal_approval",
+        principal=_TEST_APPROVER,
+        principal_role="approver",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="^BLOCKED — TRUSTED AUTHORITY NOT CONFIGURED$",
+    ):
+        glh.record_terminal_approval(
+            conn,
+            task_id,
+            authority_evidence=evidence,
+            _test_authority=_TEST_AUTHORITY,
+        )
+
+    assert kb.get_task(conn, task_id).status == "blocked"
+    assert not any(
+        event.kind == "theseus_authority_consumed"
+        for event in kb.list_events(conn, task_id)
+    )
+
+
+def test_direct_phase_transition_cannot_bypass_authority_boundary(lifecycle_db):
+    conn, tmp_path = lifecycle_db
+    task_id = _builder(conn, tmp_path)
+
+    with pytest.raises(ValueError, match="authority mutation boundary"):
+        glh._transition(
+            conn,
+            task_id,
+            glh.READY_FOR_BUILDER,
+            actor="architect",
+        )
+
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.current_step_key == glh.AWAITING_TERMINAL_APPROVAL
+
+
+def test_signed_wrong_scope_and_caller_metadata_cannot_authorize(lifecycle_db):
+    conn, tmp_path = lifecycle_db
+    task_id = _builder(conn, tmp_path)
+    wrong_scope = _signed_authority(
+        conn,
+        task_id,
+        action="record_terminal_approval",
+        evidence_type="terminal_approval",
+        principal=_TEST_APPROVER,
+        principal_role="approver",
+        overrides={"scope": "forged.scope"},
+    )
+
+    with pytest.raises(ValueError, match="binding"):
+        glh._record_terminal_approval_for_test(
+            conn,
+            task_id,
+            authority_evidence=wrong_scope,
+            test_authority=_TEST_AUTHORITY,
+            approval_ref="caller-cannot-repair-scope",
+            actor="architect",
+        )
+
+    assert kb.get_task(conn, task_id).status == "blocked"
+    assert not any(
+        event.kind == "theseus_authority_consumed"
+        for event in kb.list_events(conn, task_id)
+    )
+
+
+def test_receipt_consumption_and_transition_are_atomic_against_replay(lifecycle_db):
+    conn, tmp_path = lifecycle_db
+    task_id = _builder(conn, tmp_path)
+    evidence = _signed_authority(
+        conn,
+        task_id,
+        action="record_terminal_approval",
+        evidence_type="terminal_approval",
+        principal=_TEST_APPROVER,
+        principal_role="approver",
+    )
+
+    assert _approve(conn, task_id, evidence=evidence)
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status='blocked', current_step_key=?, block_kind='approval' WHERE id=?",
+            (glh.AWAITING_TERMINAL_APPROVAL, task_id),
+        )
+    with pytest.raises(ValueError, match="replay"):
+        _approve(conn, task_id, evidence=evidence)
+
+    task = kb.get_task(conn, task_id)
+    assert task is not None and task.status == "blocked"
+    events = kb.list_events(conn, task_id)
+    assert sum(event.kind == "theseus_authority_consumed" for event in events) == 1
+    assert sum(event.kind == "theseus_terminal_approved" for event in events) == 1
+
+
+def test_concurrent_signed_approval_has_one_state_transition(lifecycle_db):
+    conn, tmp_path = lifecycle_db
+    task_id = _builder(conn, tmp_path)
+    evidence = _signed_authority(
+        conn,
+        task_id,
+        action="record_terminal_approval",
+        evidence_type="terminal_approval",
+        principal=_TEST_APPROVER,
+        principal_role="approver",
+    )
+
+    def attempt(_index):
+        with kbc.connect_closing(board="default") as contender:
+            try:
+                _approve(contender, task_id, evidence=evidence)
+                return "accepted"
+            except ValueError:
+                return "rejected"
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        outcomes = list(pool.map(attempt, range(16)))
+
+    assert outcomes.count("accepted") == 1
+    assert outcomes.count("rejected") == 15
+    events = kb.list_events(conn, task_id)
+    assert sum(event.kind == "theseus_authority_consumed" for event in events) == 1
+    assert sum(event.kind == "theseus_terminal_approved" for event in events) == 1
+
+
 def test_glh_01_and_03_stable_task_new_run_and_approval_gate(lifecycle_db):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
@@ -81,9 +392,7 @@ def test_glh_01_and_03_stable_task_new_run_and_approval_gate(lifecycle_db):
     assert kb.list_runs(conn, task_id) == []
     assert task.worker_pid is None
 
-    assert glh.record_terminal_approval(
-        conn, task_id, approval_ref="terminal:receipt-1", approved_at=110
-    )
+    assert _approve(conn, task_id)
     first = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 41001)
     assert [item[0] for item in first.spawned] == [task_id]
     first_task = kb.get_task(conn, task_id)
@@ -115,9 +424,7 @@ def test_glh_01_and_03_stable_task_new_run_and_approval_gate(lifecycle_db):
     assert stopped.status == "blocked"
     assert stopped.current_step_key == glh.STOPPED_AWAITING_ARCHITECT
 
-    assert glh.resume_after_architect_decision(
-        conn, task_id, decision_ref="architect:decision-1", actor="architect"
-    )
+    assert _resume(conn, task_id)
     second = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 41002)
     assert [item[0] for item in second.spawned] == [task_id]
     resumed = kb.get_task(conn, task_id)
@@ -126,10 +433,38 @@ def test_glh_01_and_03_stable_task_new_run_and_approval_gate(lifecycle_db):
     assert len(kb.list_runs(conn, task_id)) == 2
 
 
+def test_investigator_creation_rejects_caller_supplied_architect_reference(lifecycle_db):
+    conn, tmp_path = lifecycle_db
+    builder_id = _builder(conn, tmp_path)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (builder_id,))
+    investigator_path = tmp_path / "investigator-wt"
+    investigator_path.mkdir()
+
+    with pytest.raises(
+        ValueError,
+        match="^BLOCKED — TRUSTED AUTHORITY NOT CONFIGURED$",
+    ):
+        glh.create_role_task(
+            conn,
+            builder_task_id=builder_id,
+            role="investigator",
+            title="Synthetic Investigator",
+            candidate_sha="b" * 40,
+            branch="pilot/investigator",
+            worktree=str(investigator_path),
+            authorization_ref="architect:caller-controlled",
+        )
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE id != ?", (builder_id,)
+    ).fetchone()[0] == 0
+
+
 def test_native_completion_finalizes_exact_run_and_phase(lifecycle_db):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
-    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:complete", approved_at=101)
+    _approve(conn, task_id)
     assert kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 41101).spawned
     task = kb.get_task(conn, task_id)
     assert task is not None and task.current_run_id is not None
@@ -152,7 +487,7 @@ def test_native_completion_finalizes_exact_run_and_phase(lifecycle_db):
 def test_native_request_review_finalizes_exact_run_and_phase(lifecycle_db):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
-    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:review", approved_at=101)
+    _approve(conn, task_id)
     assert kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 41102).spawned
     task = kb.get_task(conn, task_id)
     assert task is not None and task.current_run_id is not None
@@ -181,7 +516,7 @@ def test_native_request_changes_finalizes_exact_reviewer_run(lifecycle_db):
         conn.execute("UPDATE tasks SET status='done' WHERE id=?", (builder_id,))
     reviewer_path = tmp_path / "reviewer-wt"
     reviewer_path.mkdir()
-    reviewer_id = glh.create_role_task(
+    reviewer_id = _create_role_task(
         conn,
         builder_task_id=builder_id,
         role="reviewer",
@@ -237,7 +572,7 @@ def test_native_role_completion_finalizes_run_hashes(
         conn.execute("UPDATE tasks SET status='done' WHERE id=?", (builder_id,))
     role_path = tmp_path / worktree_name
     role_path.mkdir()
-    role_id = glh.create_role_task(
+    role_id = _create_role_task(
         conn,
         builder_task_id=builder_id,
         role=role,
@@ -307,9 +642,18 @@ def test_glh_03_expired_approval_never_creates_run_or_pid(lifecycle_db, monkeypa
     task_id = _builder(conn, tmp_path, expires_at=105)
     monkeypatch.setattr(glh.time, "time", lambda: 110)
 
-    assert not glh.record_terminal_approval(
-        conn, task_id, approval_ref="terminal:late", approved_at=106
+    expired = _signed_authority(
+        conn,
+        task_id,
+        action="record_terminal_approval",
+        evidence_type="terminal_approval",
+        principal=_TEST_APPROVER,
+        principal_role="approver",
+        issued_at=100,
+        expires_at=105,
     )
+    with pytest.raises(ValueError, match="expired"):
+        _approve(conn, task_id, evidence=expired)
     result = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 99999)
 
     assert result.spawned == []
@@ -318,15 +662,12 @@ def test_glh_03_expired_approval_never_creates_run_or_pid(lifecycle_db, monkeypa
     assert task.current_step_key == glh.AWAITING_TERMINAL_APPROVAL
     assert task.worker_pid is None
     assert kb.list_runs(conn, task_id) == []
-    assert any(event.kind == "theseus_approval_expired" for event in kb.list_events(conn, task_id))
-
-    assert glh.issue_fresh_terminal_approval(
-        conn,
-        task_id,
-        approval_ref="terminal:fresh-after-expiry",
-        approved_at=110,
-        approval_expires_at=200,
+    assert not any(
+        event.kind in {"theseus_authority_consumed", "theseus_terminal_approved"}
+        for event in kb.list_events(conn, task_id)
     )
+
+    assert _fresh_approve(conn, task_id)
     fresh = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 99998)
     assert [item[0] for item in fresh.spawned] == [task_id]
 
@@ -363,7 +704,7 @@ def test_generic_unblock_cannot_bypass_lifecycle_approval(lifecycle_db):
 def test_glh_02_resume_requires_specific_architect_decision(lifecycle_db):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
-    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:ok", approved_at=101)
+    _approve(conn, task_id)
     kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 42001)
     run_id = kb.get_task(conn, task_id).current_run_id
     glh.stop_for_architect(
@@ -378,7 +719,7 @@ def test_glh_02_resume_requires_specific_architect_decision(lifecycle_db):
         candidate_sha="b" * 40,
     )
 
-    with pytest.raises(ValueError, match="decision_ref"):
+    with pytest.raises(ValueError, match="^BLOCKED — TRUSTED AUTHORITY NOT CONFIGURED$"):
         glh.resume_after_architect_decision(conn, task_id, decision_ref="", actor="architect")
 
     assert kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 42002).spawned == []
@@ -388,7 +729,7 @@ def test_glh_02_resume_requires_specific_architect_decision(lifecycle_db):
 def test_resume_rejects_forged_actor_and_actual_git_mismatch(lifecycle_db, monkeypatch):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
-    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:stop", approved_at=101)
+    _approve(conn, task_id)
     kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 42011)
     run_id = kb.get_task(conn, task_id).current_run_id
     assert run_id is not None
@@ -403,7 +744,7 @@ def test_resume_rejects_forged_actor_and_actual_git_mismatch(lifecycle_db, monke
         baseline_sha="a" * 40,
         candidate_sha="b" * 40,
     )
-    with pytest.raises(ValueError, match="Architect authority"):
+    with pytest.raises(ValueError, match="^BLOCKED — TRUSTED AUTHORITY NOT CONFIGURED$"):
         glh.resume_after_architect_decision(
             conn, task_id, decision_ref="forged", actor="builder"
         )
@@ -417,9 +758,23 @@ def test_resume_rejects_forged_actor_and_actual_git_mismatch(lifecycle_db, monke
             "parent": "a" * 40,
         },
     )
+    stop = glh._event_payload(conn, task_id, "theseus_architect_stop")
+    assert stop is not None
     with pytest.raises(ValueError, match="Git identity"):
-        glh.resume_after_architect_decision(
-            conn, task_id, decision_ref="architect:exact-stop", actor="architect"
+        glh._resume_after_architect_decision_for_test(
+            conn,
+            task_id,
+            authority_evidence=_signed_authority(
+                conn,
+                task_id,
+                action="resume_after_architect_decision",
+                evidence_type="architect_decision",
+                principal=_TEST_ARCHITECT,
+                principal_role="architect",
+                run_id=int(run_id),
+                stop_token=stop["stop_token"],
+            ),
+            test_authority=_TEST_AUTHORITY,
         )
 
 
@@ -434,7 +789,7 @@ def test_legacy_task_dispatch_is_unchanged(lifecycle_db):
 def test_glh_04_and_05_crash_recovery_requires_fresh_approval(lifecycle_db, monkeypatch):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
-    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:ok", approved_at=101)
+    _approve(conn, task_id)
     assert len(kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 45001).spawned) == 1
     first_run = kb.get_task(conn, task_id).current_run_id
 
@@ -459,7 +814,7 @@ def test_glh_04_and_05_crash_recovery_requires_fresh_approval(lifecycle_db, monk
 def test_glh_06_two_dispatch_ticks_create_one_run(lifecycle_db):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
-    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:ok", approved_at=101)
+    _approve(conn, task_id)
     calls = []
 
     first = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: calls.append(task_id) or 46001)
@@ -474,9 +829,7 @@ def test_glh_06_two_dispatch_ticks_create_one_run(lifecycle_db):
 def test_isolated_pilot_uses_synthetic_subprocess_and_run_readback(lifecycle_db):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
-    assert glh.record_terminal_approval(
-        conn, task_id, approval_ref="terminal:pilot", approved_at=101
-    )
+    assert _approve(conn, task_id)
     workers: list[subprocess.Popen] = []
 
     def spawn_synthetic(*_args, **_kwargs):
@@ -534,7 +887,7 @@ def test_glh_07_reviewer_and_investigator_use_separate_linked_worktrees(lifecycl
     investigator_path = tmp_path / "investigator-wt"
     reviewer_path.mkdir()
     investigator_path.mkdir()
-    reviewer_id = glh.create_role_task(
+    reviewer_id = _create_role_task(
         conn,
         builder_task_id=builder_id,
         role="reviewer",
@@ -543,7 +896,7 @@ def test_glh_07_reviewer_and_investigator_use_separate_linked_worktrees(lifecycl
         branch="pilot/reviewer",
         worktree=str(reviewer_path),
     )
-    investigator_id = glh.create_role_task(
+    investigator_id = _create_role_task(
         conn,
         builder_task_id=builder_id,
         role="investigator",
@@ -574,7 +927,7 @@ def test_role_candidate_collision_and_nonconcurrency_are_enforced(lifecycle_db, 
     investigator_path.mkdir()
 
     with pytest.raises(ValueError, match="candidate"):
-        glh.create_role_task(
+        _create_role_task(
             conn,
             builder_task_id=builder_id,
             role="reviewer",
@@ -590,7 +943,7 @@ def test_role_candidate_collision_and_nonconcurrency_are_enforced(lifecycle_db, 
         return {"root": path, "branch": branch, "head": "b" * 40, "parent": "a" * 40}
 
     monkeypatch.setattr(glh, "_read_git_identity", identity)
-    reviewer_id = glh.create_role_task(
+    reviewer_id = _create_role_task(
         conn,
         builder_task_id=builder_id,
         role="reviewer",
@@ -600,7 +953,7 @@ def test_role_candidate_collision_and_nonconcurrency_are_enforced(lifecycle_db, 
         worktree=str(reviewer_path),
     )
     with pytest.raises(ValueError, match="worktree|branch"):
-        glh.create_role_task(
+        _create_role_task(
             conn,
             builder_task_id=builder_id,
             role="investigator",
@@ -610,7 +963,7 @@ def test_role_candidate_collision_and_nonconcurrency_are_enforced(lifecycle_db, 
             worktree=str(reviewer_path),
             authorization_ref="architect:investigate",
         )
-    investigator_id = glh.create_role_task(
+    investigator_id = _create_role_task(
         conn,
         builder_task_id=builder_id,
         role="investigator",
@@ -649,7 +1002,7 @@ def test_role_native_claim_rejects_wrong_capability_and_active_peer(lifecycle_db
             "parent": "a" * 40,
         },
     )
-    reviewer_id = glh.create_role_task(
+    reviewer_id = _create_role_task(
         conn,
         builder_task_id=builder_id,
         role="reviewer",
@@ -658,7 +1011,7 @@ def test_role_native_claim_rejects_wrong_capability_and_active_peer(lifecycle_db
         branch="pilot/reviewer-native",
         worktree=str(reviewer_path),
     )
-    investigator_id = glh.create_role_task(
+    investigator_id = _create_role_task(
         conn,
         builder_task_id=builder_id,
         role="investigator",
@@ -842,7 +1195,7 @@ def test_artifact_manifest_write_failure_removes_partial_file(lifecycle_db, monk
 def test_missing_pid_and_pid_bind_failure_are_not_reported_as_spawned(lifecycle_db, monkeypatch):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
-    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:pid", approved_at=101)
+    _approve(conn, task_id)
 
     missing = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 0)
     assert missing.spawned == []
@@ -857,13 +1210,7 @@ def test_missing_pid_and_pid_bind_failure_are_not_reported_as_spawned(lifecycle_
             "UPDATE tasks SET status='blocked', current_step_key=?, block_kind='approval' WHERE id=?",
             (glh.AWAITING_TERMINAL_APPROVAL, task_id),
         )
-    glh.issue_fresh_terminal_approval(
-        conn,
-        task_id,
-        approval_ref="terminal:pid-fresh",
-        approved_at=101,
-        approval_expires_at=200,
-    )
+    _fresh_approve(conn, task_id)
     terminated = []
     monkeypatch.setattr(kbd, "_set_worker_pid", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(
@@ -884,7 +1231,7 @@ def test_missing_pid_and_pid_bind_failure_are_not_reported_as_spawned(lifecycle_
 def test_pid_bind_failure_does_not_kill_unverified_process(lifecycle_db, monkeypatch):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
-    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:pid-safe", approved_at=101)
+    _approve(conn, task_id)
     terminated = []
     monkeypatch.setattr(kbd, "_set_worker_pid", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(
@@ -946,9 +1293,7 @@ def test_pid_bind_exception_terminates_verified_child_and_preserves_retry_integr
 ):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
-    glh.record_terminal_approval(
-        conn, task_id, approval_ref="terminal:pid-exception", approved_at=101
-    )
+    _approve(conn, task_id)
     original_set_worker_pid = kbd._set_worker_pid
     terminated = []
 
@@ -986,13 +1331,7 @@ def test_pid_bind_exception_terminates_verified_child_and_preserves_retry_integr
             "UPDATE tasks SET status='blocked', current_step_key=?, block_kind='approval' WHERE id=?",
             (glh.AWAITING_TERMINAL_APPROVAL, task_id),
         )
-    assert glh.issue_fresh_terminal_approval(
-        conn,
-        task_id,
-        approval_ref="terminal:pid-exception-retry",
-        approved_at=101,
-        approval_expires_at=200,
-    )
+    assert _fresh_approve(conn, task_id)
     retry = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 49004)
     assert [item[0] for item in retry.spawned] == [task_id]
     assert kb.get_task(conn, task_id).worker_pid == 49004
@@ -1093,9 +1432,7 @@ def test_all_dispatch_and_native_claim_routes_reject_non_designated_host(
 ):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
-    assert glh.record_terminal_approval(
-        conn, task_id, approval_ref=f"terminal:host-{profile or 'missing'}", approved_at=101
-    )
+    assert _approve(conn, task_id)
     if profile:
         monkeypatch.setenv("HERMES_PROFILE", profile)
     else:
@@ -1123,7 +1460,7 @@ def test_all_dispatch_and_native_claim_routes_reject_non_designated_host(
 def test_glh_10_stop_wins_over_late_heartbeat_and_recovery(lifecycle_db):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
-    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:ok", approved_at=101)
+    _approve(conn, task_id)
     kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 47001)
     run_id = kb.get_task(conn, task_id).current_run_id
     assert glh.stop_for_architect(
@@ -1148,7 +1485,7 @@ def test_glh_10_stop_wins_over_late_heartbeat_and_recovery(lifecycle_db):
 def test_stop_is_one_fenced_transaction_without_unblock_gap(lifecycle_db, monkeypatch):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
-    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:race", approved_at=101)
+    _approve(conn, task_id)
     kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 47011)
     task = kb.get_task(conn, task_id)
     assert task is not None and task.current_run_id is not None
@@ -1183,7 +1520,7 @@ def test_stop_is_one_fenced_transaction_without_unblock_gap(lifecycle_db, monkey
 def test_glh_11_stop_payload_is_redacted(lifecycle_db):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
-    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:ok", approved_at=101)
+    _approve(conn, task_id)
     kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 48001)
     run_id = kb.get_task(conn, task_id).current_run_id
     secret = "ghp_" + ("x" * 40)
@@ -1227,7 +1564,7 @@ def test_glh_12_dispatch_diagnostics_distinguish_no_spawn_reasons(lifecycle_db, 
         assert glh.dispatch_diagnostic(conn, task_id, **defaults)["reason"] == "approval_blocked"
 
 
-def test_lifecycle_cli_show_and_approve_use_active_board(lifecycle_db):
+def test_lifecycle_cli_show_and_approve_fail_closed_on_active_board(lifecycle_db):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
 
@@ -1236,11 +1573,8 @@ def test_lifecycle_cli_show_and_approve_use_active_board(lifecycle_db):
     assert shown["phase"] == glh.AWAITING_TERMINAL_APPROVAL
     assert shown["dispatch_diagnostic"]["reason"] == "approval_blocked"
 
-    approved = json.loads(
-        kc.run_slash(
-            f"lifecycle approve {task_id} --approval-ref terminal:cli-1 "
-            "--approved-at 101 --json"
-        )
+    blocked = kc.run_slash(
+        f"lifecycle approve {task_id} --authority-evidence forged --json"
     )
-    assert approved == {"approved": True, "task_id": task_id}
-    assert kb.get_task(conn, task_id).status == "ready"
+    assert "BLOCKED — TRUSTED AUTHORITY NOT CONFIGURED" in blocked
+    assert kb.get_task(conn, task_id).status == "blocked"

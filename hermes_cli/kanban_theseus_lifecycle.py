@@ -8,6 +8,7 @@ without :data:`WORKFLOW_TEMPLATE_ID`.
 from __future__ import annotations
 
 import hashlib
+import contextlib
 import json
 import os
 import re
@@ -15,13 +16,25 @@ import secrets
 import stat
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_authority_verifier import AuthorityVerifier
 
 WORKFLOW_TEMPLATE_ID = "theseus-gateway-lifecycle-v1"
 DESIGNATED_DISPATCHER_PROFILE = "theseus-builder"
+AUTHORITY_SCOPE = "theseus.gateway-kanban-lifecycle"
+PRODUCTION_AUTHORITY_BLOCKED = "BLOCKED — TRUSTED AUTHORITY NOT CONFIGURED"
+
+
+@dataclass(frozen=True)
+class SyntheticAuthorityTestConfiguration:
+    """Explicit test-only verifier injection; production call paths never accept it."""
+
+    verifier: AuthorityVerifier
+    test_only: bool = True
 
 PLANNED = "PLANNED"
 AWAITING_TERMINAL_APPROVAL = "AWAITING_TERMINAL_APPROVAL"
@@ -97,6 +110,51 @@ def _event_payload(conn, task_id: str, kind: str) -> Optional[dict]:
     return value if isinstance(value, dict) else None
 
 
+def _authority_gate_locked(
+    conn,
+    task_id: str,
+    *,
+    authority_evidence: str | bytes | None,
+    expected_bindings: dict[str, object],
+    test_authority: SyntheticAuthorityTestConfiguration | None,
+):
+    """Verify and consume authority inside the caller's state-transition txn."""
+    if test_authority is None or test_authority.test_only is not True:
+        raise ValueError(PRODUCTION_AUTHORITY_BLOCKED)
+    if authority_evidence is None:
+        raise ValueError(PRODUCTION_AUTHORITY_BLOCKED)
+
+    def consume_once(issuer: str, nonce: str, digest: str) -> bool:
+        replay = conn.execute(
+            "SELECT 1 FROM task_events WHERE kind='theseus_authority_consumed' "
+            "AND json_extract(payload, '$.issuer')=? "
+            "AND json_extract(payload, '$.nonce')=? LIMIT 1",
+            (issuer, nonce),
+        ).fetchone()
+        if replay is not None:
+            return False
+        kb._append_event(
+            conn,
+            task_id,
+            "theseus_authority_consumed",
+            {
+                "issuer": issuer,
+                "nonce": nonce,
+                "evidence_digest": digest,
+                "action": expected_bindings["action"],
+                "scope": expected_bindings["scope"],
+            },
+        )
+        return True
+
+    return test_authority.verifier.verify_and_consume(
+        authority_evidence,
+        expected=expected_bindings,
+        now=int(time.time()),
+        consume_once=consume_once,
+    )
+
+
 def package_metadata(conn, task_id: str) -> Optional[dict]:
     return _event_payload(conn, task_id, "theseus_lifecycle_initialized")
 
@@ -135,6 +193,13 @@ def _transition(
     if task is None or task.workflow_template_id != WORKFLOW_TEMPLATE_ID:
         raise ValueError("task is not opted into the THESEUS lifecycle")
     previous = task.current_step_key or PLANNED
+    if phase == READY_FOR_BUILDER and previous in {
+        AWAITING_TERMINAL_APPROVAL,
+        STOPPED_AWAITING_ARCHITECT,
+        CHANGES_REQUESTED,
+        CORRECTION_READY,
+    }:
+        raise ValueError("authority mutation boundary is required for this phase transition")
     allowed = set(allowed_from) if allowed_from is not None else _ALLOWED_TRANSITIONS.get(previous, set())
     if phase not in allowed:
         raise ValueError(f"invalid THESEUS phase transition: {previous} -> {phase}")
@@ -216,96 +281,137 @@ def create_builder_task(
     return task_id
 
 
-def record_terminal_approval(
+def _record_terminal_approval_locked(
     conn,
     task_id: str,
     *,
-    approval_ref: str,
-    approved_at: int,
+    authority_evidence: str | bytes | None,
+    test_authority: SyntheticAuthorityTestConfiguration | None,
+    action: str,
+    renew_window: bool,
 ) -> bool:
-    """Record a task-bound, one-use terminal receipt using trusted wall time."""
-    approval_ref = kb.redact_review_value(_require_text("approval_ref", approval_ref))
     task = kb.get_task(conn, task_id)
     metadata = package_metadata(conn, task_id)
     if task is None or metadata is None or task.current_step_key != AWAITING_TERMINAL_APPROVAL:
         raise ValueError("task is not awaiting terminal approval")
-    approved_at = int(approved_at)
-    now = int(time.time())
-    window = _event_payload(conn, task_id, "theseus_approval_window_renewed") or metadata
-    expires_at = int(window["approval_expires_at"])
-    if approved_at > now or approved_at > expires_at or now > expires_at:
-        with kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET status='blocked', worker_pid=NULL WHERE id=?", (task_id,))
-            kb._append_event(
-                conn,
-                task_id,
-                "theseus_approval_expired",
-                {"approval_ref": approval_ref, "approved_at": approved_at, "approval_expires_at": expires_at},
-            )
-        return False
     if task.current_run_id is not None or task.worker_pid is not None:
         raise ValueError("approval pre-dispatch task already has an active run/PID")
-    receipt_id = hashlib.sha256(
-        f"{task_id}\0{approval_ref}\0{approved_at}\0{expires_at}".encode()
-    ).hexdigest()
-    with kb.write_txn(conn):
-        replay = conn.execute(
-            "SELECT 1 FROM task_events WHERE kind='theseus_terminal_approved' "
-            "AND json_extract(payload, '$.receipt_id')=? LIMIT 1",
-            (receipt_id,),
-        ).fetchone()
-        if replay is not None:
-            raise ValueError("terminal approval receipt was already issued")
-        changed = conn.execute(
-            "UPDATE tasks SET status='ready', current_step_key=?, block_kind=NULL "
-            "WHERE id=? AND status='blocked' AND current_step_key=? AND current_run_id IS NULL AND worker_pid IS NULL",
-            (READY_FOR_BUILDER, task_id, AWAITING_TERMINAL_APPROVAL),
-        )
-        if changed.rowcount != 1:
-            raise ValueError("approval state changed concurrently")
+    verified = _authority_gate_locked(
+        conn,
+        task_id,
+        authority_evidence=authority_evidence,
+        test_authority=test_authority,
+        expected_bindings={
+            "version": 1,
+            "algorithm": "Ed25519",
+            "principal_role": "approver",
+            "evidence_type": "terminal_approval",
+            "action": action,
+            "scope": AUTHORITY_SCOPE,
+            "package_id": metadata["package_id"],
+            "task_id": task_id,
+            "run_id": 0,
+            "stop_token": "none",
+            "code_sha": metadata["candidate_sha"],
+        },
+    )
+    payload = verified.payload
+    window = _event_payload(conn, task_id, "theseus_approval_window_renewed") or metadata
+    window_expires_at = int(window["approval_expires_at"])
+    if not renew_window and int(payload["expires_at"]) > window_expires_at:
+        raise ValueError("authority evidence exceeds the configured approval window")
+    if renew_window:
+        window_expires_at = int(payload["expires_at"])
         kb._append_event(
             conn,
             task_id,
-            "theseus_terminal_approved",
-            {
-                "approval_ref": approval_ref,
-                "approved_at": approved_at,
-                "approval_expires_at": expires_at,
-                "receipt_id": receipt_id,
-                "task_id": task_id,
-                "phase": READY_FOR_BUILDER,
-            },
+            "theseus_approval_window_renewed",
+            {"approval_expires_at": window_expires_at, "issued_at": payload["issued_at"]},
         )
+    changed = conn.execute(
+        "UPDATE tasks SET status='ready', current_step_key=?, block_kind=NULL "
+        "WHERE id=? AND status='blocked' AND current_step_key=? "
+        "AND current_run_id IS NULL AND worker_pid IS NULL",
+        (READY_FOR_BUILDER, task_id, AWAITING_TERMINAL_APPROVAL),
+    )
+    if changed.rowcount != 1:
+        raise ValueError("approval state changed concurrently")
+    kb._append_event(
+        conn,
+        task_id,
+        "theseus_terminal_approved",
+        {
+            "issuer": payload["issuer"],
+            "principal": payload["principal"],
+            "approved_at": payload["issued_at"],
+            "approval_expires_at": payload["expires_at"],
+            "receipt_id": verified.evidence_digest,
+            "task_id": task_id,
+            "phase": READY_FOR_BUILDER,
+        },
+    )
     return True
+
+
+def record_terminal_approval(
+    conn,
+    task_id: str,
+    *,
+    authority_evidence: str | bytes | None = None,
+    **_caller_metadata: object,
+) -> bool:
+    """Production entrypoint; unavailable until a trusted authority is configured."""
+    raise ValueError(PRODUCTION_AUTHORITY_BLOCKED)
+
+
+def _record_terminal_approval_for_test(
+    conn,
+    task_id: str,
+    *,
+    authority_evidence: str | bytes,
+    test_authority: SyntheticAuthorityTestConfiguration,
+    **_caller_metadata: object,
+) -> bool:
+    """Exercise the real mutation boundary with explicit synthetic test authority."""
+    with kb.write_txn(conn):
+        return _record_terminal_approval_locked(
+            conn,
+            task_id,
+            authority_evidence=authority_evidence,
+            test_authority=test_authority,
+            action="record_terminal_approval",
+            renew_window=False,
+        )
 
 
 def issue_fresh_terminal_approval(
     conn,
     task_id: str,
     *,
-    approval_ref: str,
-    approved_at: int,
-    approval_expires_at: int,
+    authority_evidence: str | bytes | None = None,
+    **_caller_metadata: object,
 ) -> bool:
-    """Issue a distinct approval window after expiry using trusted wall time."""
-    now = int(time.time())
-    approved_at = int(approved_at)
-    expires_at = int(approval_expires_at)
-    if approved_at > now or expires_at <= now or approved_at > expires_at:
-        raise ValueError("fresh approval timestamps are not currently valid")
-    task = kb.get_task(conn, task_id)
-    if task is None or task.current_step_key != AWAITING_TERMINAL_APPROVAL:
-        raise ValueError("task is not awaiting terminal approval")
+    """Production entrypoint; unavailable until a trusted authority is configured."""
+    raise ValueError(PRODUCTION_AUTHORITY_BLOCKED)
+
+
+def _issue_fresh_terminal_approval_for_test(
+    conn,
+    task_id: str,
+    *,
+    authority_evidence: str | bytes,
+    test_authority: SyntheticAuthorityTestConfiguration,
+) -> bool:
+    """Exercise fresh approval with explicit synthetic test authority."""
     with kb.write_txn(conn):
-        kb._append_event(
+        return _record_terminal_approval_locked(
             conn,
             task_id,
-            "theseus_approval_window_renewed",
-            {"approval_expires_at": expires_at, "issued_at": now},
+            authority_evidence=authority_evidence,
+            test_authority=test_authority,
+            action="issue_fresh_terminal_approval",
+            renew_window=True,
         )
-    return record_terminal_approval(
-        conn, task_id, approval_ref=approval_ref, approved_at=approved_at
-    )
 
 
 def _approval_for_claim(conn, task_id: str) -> Optional[dict]:
@@ -593,7 +699,60 @@ def create_role_task(
     candidate_sha: str,
     branch: str,
     worktree: str,
-    authorization_ref: Optional[str] = None,
+    authority_evidence: str | bytes | None = None,
+    **_caller_metadata: object,
+) -> str:
+    """Create a Reviewer task; production Investigator authority is unavailable."""
+    return _create_role_task_impl(
+        conn,
+        builder_task_id=builder_task_id,
+        role=role,
+        title=title,
+        candidate_sha=candidate_sha,
+        branch=branch,
+        worktree=worktree,
+        authority_evidence=authority_evidence,
+        test_authority=None,
+    )
+
+
+def _create_role_task_for_test(
+    conn,
+    *,
+    builder_task_id: str,
+    role: str,
+    title: str,
+    candidate_sha: str,
+    branch: str,
+    worktree: str,
+    authority_evidence: str | bytes,
+    test_authority: SyntheticAuthorityTestConfiguration,
+) -> str:
+    """Exercise Investigator creation with explicit synthetic test authority."""
+    return _create_role_task_impl(
+        conn,
+        builder_task_id=builder_task_id,
+        role=role,
+        title=title,
+        candidate_sha=candidate_sha,
+        branch=branch,
+        worktree=worktree,
+        authority_evidence=authority_evidence,
+        test_authority=test_authority,
+    )
+
+
+def _create_role_task_impl(
+    conn,
+    *,
+    builder_task_id: str,
+    role: str,
+    title: str,
+    candidate_sha: str,
+    branch: str,
+    worktree: str,
+    authority_evidence: str | bytes | None,
+    test_authority: SyntheticAuthorityTestConfiguration | None,
 ) -> str:
     """Create an isolated Reviewer or Investigator task linked to Builder."""
     if role not in {"reviewer", "investigator"}:
@@ -614,53 +773,73 @@ def create_role_task(
     builder_candidate = _require_sha("builder candidate_sha", str(builder_meta.get("candidate_sha") or ""))
     if candidate_sha != builder_candidate:
         raise ValueError("linked role candidate must equal the Builder candidate")
-    if role == "investigator" and not str(authorization_ref or "").startswith("architect:"):
-        raise ValueError("Investigator creation requires explicit Architect authorization")
+
     actual = _read_git_identity(worktree)
     if actual["root"] != worktree or actual["branch"] != branch or actual["head"] != candidate_sha:
         raise ValueError(f"actual Git identity does not match the {role} task")
     package_id = _require_text("package_id", builder_meta.get("package_id"))
-    collision = conn.execute(
-        "SELECT t.id FROM tasks t JOIN task_events e ON e.task_id=t.id "
-        "WHERE e.kind='theseus_lifecycle_initialized' "
-        "AND json_extract(e.payload, '$.package_id')=? AND t.id!=? AND t.status!='archived' "
-        "AND (t.workspace_path=? OR t.branch_name=?) LIMIT 1",
-        (package_id, builder_task_id, worktree, branch),
-    ).fetchone()
-    if collision is not None:
-        raise ValueError("role worktree or branch collides with another active package task")
-    task_id = kb.create_task(
-        conn,
-        title=title,
-        body=(
-            f"Pinned candidate: {candidate_sha}. Read-only {role} authority: "
-            "do not modify application source, publish, merge, or reuse the Builder worktree."
-        ),
-        assignee=ROLE_PROFILES[role],
-        workspace_kind="worktree",
-        workspace_path=worktree,
-        branch_name=branch,
-        parents=(builder_task_id,),
-        idempotency_key=f"theseus-work-package:{package_id}:{role}:{candidate_sha}",
-        created_by="theseus-lifecycle",
-    )
-    task = kb.get_task(conn, task_id)
-    if task is not None and task.workflow_template_id == WORKFLOW_TEMPLATE_ID:
-        return task_id
-    metadata = {
-        "package_id": package_id,
-        "role": role,
-        "builder_task_id": builder_task_id,
-        "baseline_sha": builder_meta.get("baseline_sha"),
-        "candidate_sha": candidate_sha,
-        "branch": branch,
-        "worktree": worktree,
-        "authority": "read-only",
-        "publish_allowed": False,
-        "merge_allowed": False,
-        "dispatcher_profile": DESIGNATED_DISPATCHER_PROFILE,
-    }
-    with kb.write_txn(conn):
+    transaction = kb.write_txn(conn) if role == "investigator" else contextlib.nullcontext()
+    with transaction:
+        if role == "investigator":
+            _authority_gate_locked(
+                conn,
+                builder_task_id,
+                authority_evidence=authority_evidence,
+                test_authority=test_authority,
+                expected_bindings={
+                    "version": 1,
+                    "algorithm": "Ed25519",
+                    "principal_role": "architect",
+                    "evidence_type": "architect_decision",
+                    "action": "create_investigator_task",
+                    "scope": AUTHORITY_SCOPE,
+                    "package_id": package_id,
+                    "task_id": builder_task_id,
+                    "run_id": 0,
+                    "stop_token": "none",
+                    "code_sha": candidate_sha,
+                },
+            )
+        collision = conn.execute(
+            "SELECT t.id FROM tasks t JOIN task_events e ON e.task_id=t.id "
+            "WHERE e.kind='theseus_lifecycle_initialized' "
+            "AND json_extract(e.payload, '$.package_id')=? AND t.id!=? AND t.status!='archived' "
+            "AND (t.workspace_path=? OR t.branch_name=?) LIMIT 1",
+            (package_id, builder_task_id, worktree, branch),
+        ).fetchone()
+        if collision is not None:
+            raise ValueError("role worktree or branch collides with another active package task")
+        task_id = kb.create_task(
+            conn,
+            title=title,
+            body=(
+                f"Pinned candidate: {candidate_sha}. Read-only {role} authority: "
+                "do not modify application source, publish, merge, or reuse the Builder worktree."
+            ),
+            assignee=ROLE_PROFILES[role],
+            workspace_kind="worktree",
+            workspace_path=worktree,
+            branch_name=branch,
+            parents=(builder_task_id,),
+            idempotency_key=f"theseus-work-package:{package_id}:{role}:{candidate_sha}",
+            created_by="theseus-lifecycle",
+        )
+        task = kb.get_task(conn, task_id)
+        if task is not None and task.workflow_template_id == WORKFLOW_TEMPLATE_ID:
+            return task_id
+        metadata = {
+            "package_id": package_id,
+            "role": role,
+            "builder_task_id": builder_task_id,
+            "baseline_sha": builder_meta.get("baseline_sha"),
+            "candidate_sha": candidate_sha,
+            "branch": branch,
+            "worktree": worktree,
+            "authority": "read-only",
+            "publish_allowed": False,
+            "merge_allowed": False,
+            "dispatcher_profile": DESIGNATED_DISPATCHER_PROFILE,
+        }
         conn.execute(
             "UPDATE tasks SET workflow_template_id=?, current_step_key=? WHERE id=?",
             (WORKFLOW_TEMPLATE_ID, ROLE_READY_PHASE[role], task_id),
@@ -698,11 +877,25 @@ def _read_git_identity(worktree: str) -> dict[str, str]:
     }
 
 
-def resume_after_architect_decision(conn, task_id: str, *, decision_ref: str, actor: str) -> bool:
-    decision_ref = kb.redact_review_value(_require_text("decision_ref", decision_ref))
-    actor = kb.redact_review_value(_require_text("actor", actor))
-    if actor != "architect":
-        raise ValueError("Architect authority is required for resume")
+def resume_after_architect_decision(
+    conn,
+    task_id: str,
+    *,
+    authority_evidence: str | bytes | None = None,
+    **_caller_metadata: object,
+) -> bool:
+    """Production entrypoint; unavailable until a trusted authority is configured."""
+    raise ValueError(PRODUCTION_AUTHORITY_BLOCKED)
+
+
+def _resume_after_architect_decision_for_test(
+    conn,
+    task_id: str,
+    *,
+    authority_evidence: str | bytes,
+    test_authority: SyntheticAuthorityTestConfiguration,
+) -> bool:
+    """Exercise Architect resume with explicit synthetic test authority."""
     task = kb.get_task(conn, task_id)
     stop = _event_payload(conn, task_id, "theseus_architect_stop")
     if task is None or stop is None or task.current_step_key != STOPPED_AWAITING_ARCHITECT:
@@ -734,6 +927,25 @@ def resume_after_architect_decision(conn, task_id: str, *, decision_ref: str, ac
     }:
         raise ValueError("actual Git identity does not match the fenced work package")
     with kb.write_txn(conn):
+        verified = _authority_gate_locked(
+            conn,
+            task_id,
+            authority_evidence=authority_evidence,
+            test_authority=test_authority,
+            expected_bindings={
+                "version": 1,
+                "algorithm": "Ed25519",
+                "principal_role": "architect",
+                "evidence_type": "architect_decision",
+                "action": "resume_after_architect_decision",
+                "scope": AUTHORITY_SCOPE,
+                "package_id": metadata["package_id"],
+                "task_id": task_id,
+                "run_id": int(stop["stopped_run_id"]),
+                "stop_token": stop["stop_token"],
+                "code_sha": expected_candidate,
+            },
+        )
         changed = conn.execute(
             "UPDATE tasks SET status='ready', current_step_key=?, block_kind=NULL "
             "WHERE id=? AND status='blocked' AND current_step_key=? AND worker_pid IS NULL",
@@ -741,24 +953,15 @@ def resume_after_architect_decision(conn, task_id: str, *, decision_ref: str, ac
         )
         if changed.rowcount != 1:
             raise ValueError("STOP state changed concurrently")
-        decision_id = hashlib.sha256(
-            f"{task_id}\0{stop['stop_token']}\0{decision_ref}".encode()
-        ).hexdigest()
-        replay = conn.execute(
-            "SELECT 1 FROM task_events WHERE kind='theseus_architect_decision' "
-            "AND json_extract(payload, '$.decision_id')=? LIMIT 1",
-            (decision_id,),
-        ).fetchone()
-        if replay is not None:
-            raise ValueError("Architect decision receipt was already used")
+        payload = verified.payload
         kb._append_event(
             conn,
             task_id,
             "theseus_architect_decision",
             {
-                "actor": actor,
-                "decision_ref": decision_ref,
-                "decision_id": decision_id,
+                "actor": payload["principal"],
+                "issuer": payload["issuer"],
+                "decision_id": verified.evidence_digest,
                 "stop_token": stop["stop_token"],
                 "resolves_stop_run_id": stop["stopped_run_id"],
                 "phase": READY_FOR_BUILDER,

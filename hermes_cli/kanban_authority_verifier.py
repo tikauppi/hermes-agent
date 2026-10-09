@@ -78,16 +78,24 @@ class AuthorityVerifier:
         self,
         *,
         trusted_keys: Mapping[tuple[str, str], bytes],
+        authorized_principals: Mapping[tuple[str, str], frozenset[str] | set[str]],
+        revoked_issuers: set[str] | frozenset[str] = frozenset(),
+        revoked_keys: set[tuple[str, str]] | frozenset[tuple[str, str]] = frozenset(),
         revoked_nonces: set[str] | frozenset[str] = frozenset(),
     ) -> None:
         self._trusted_keys = dict(trusted_keys)
+        self._authorized_principals = {
+            key: frozenset(roles) for key, roles in authorized_principals.items()
+        }
+        self._revoked_issuers = frozenset(revoked_issuers)
+        self._revoked_keys = frozenset(revoked_keys)
         self._revoked_nonces = frozenset(revoked_nonces)
 
     def verify_and_consume(
         self,
         envelope: str | bytes,
         *,
-        expected: AuthorityExpectation,
+        expected: AuthorityExpectation | Mapping[str, object],
         now: int,
         consume_once: Callable[[str, str, str], bool],
     ) -> VerifiedAuthorityEvidence:
@@ -109,29 +117,43 @@ class AuthorityVerifier:
         except (InvalidSignature, KeyError, TypeError, ValueError, UnicodeError, binascii.Error) as exc:
             raise AuthorityEvidenceRejected("authority evidence signature is invalid") from exc
 
-        expected_payload = {
-            field: getattr(expected, field) for field in AuthorityExpectation.__dataclass_fields__
-        }
-        if payload != expected_payload:
+        expected_payload = (
+            {field: getattr(expected, field) for field in AuthorityExpectation.__dataclass_fields__}
+            if isinstance(expected, AuthorityExpectation)
+            else dict(expected)
+        )
+        if any(
+            field not in _PAYLOAD_FIELDS or payload.get(field) != value
+            for field, value in expected_payload.items()
+        ):
             raise AuthorityEvidenceRejected("authority evidence binding mismatch")
+        if issuer in self._revoked_issuers or (issuer, key_id) in self._revoked_keys:
+            raise AuthorityEvidenceRejected("authority evidence issuer or key was revoked")
+        authorized_roles = self._authorized_principals.get((issuer, payload["principal"]))
+        if authorized_roles is None or payload["principal_role"] not in authorized_roles:
+            raise AuthorityEvidenceRejected("authority evidence principal authorization failed")
+        integer_fields = ("version", "run_id", "issued_at", "expires_at")
+        integers_are_safe = all(
+            isinstance(payload[field], int)
+            and not isinstance(payload[field], bool)
+            and 0 <= payload[field] < 2**63
+            for field in integer_fields
+        )
         if (
-            payload["version"] != 1
+            not integers_are_safe
+            or payload["version"] != 1
             or payload["algorithm"] != "Ed25519"
-            or not isinstance(payload["run_id"], int)
-            or isinstance(payload["run_id"], bool)
-            or not isinstance(payload["issued_at"], int)
-            or not isinstance(payload["expires_at"], int)
             or not _SHA_RE.fullmatch(payload["code_sha"])
             or not all(
                 isinstance(payload[field], str) and bool(payload[field])
                 for field in _PAYLOAD_FIELDS
-                if field not in {"version", "run_id", "issued_at", "expires_at"}
+                if field not in integer_fields
             )
         ):
             raise AuthorityEvidenceRejected("authority evidence payload is malformed")
         if payload["issued_at"] > int(now):
             raise AuthorityEvidenceRejected("authority evidence is not yet valid")
-        if payload["expires_at"] < int(now) or payload["expires_at"] <= payload["issued_at"]:
+        if payload["expires_at"] <= int(now) or payload["expires_at"] <= payload["issued_at"]:
             raise AuthorityEvidenceRejected("authority evidence expired")
         if nonce in self._revoked_nonces:
             raise AuthorityEvidenceRejected("authority evidence was revoked")
