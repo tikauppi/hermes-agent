@@ -204,6 +204,18 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban dispatcher: cannot load config (%s); disabled", exc)
             return None
         kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        try:
+            from hermes_cli.kanban_theseus_lifecycle import validate_dispatcher_host
+
+            profile = (
+                os.environ.get("HERMES_PROFILE_NAME")
+                or os.environ.get("HERMES_PROFILE")
+                or "default"
+            )
+            validate_dispatcher_host(profile, kanban_cfg)
+        except ValueError as exc:
+            logger.error("kanban dispatcher: lifecycle host policy rejected startup: %s", exc)
+            return None
         if not kanban_cfg.get("dispatch_in_gateway", True):
             logger.info("kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false")
             return None

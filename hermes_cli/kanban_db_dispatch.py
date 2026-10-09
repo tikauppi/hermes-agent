@@ -284,6 +284,19 @@ def _sigkill(kill, pid: int) -> bool:
         return False
 
 
+def _is_verified_new_child(pid: int) -> bool:
+    """Fail closed unless ``pid`` is currently a direct child of this dispatcher."""
+    pid = int(pid)
+    if pid <= 0 or not sys.platform.startswith("linux"):
+        return False
+    try:
+        stat_line = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        fields = stat_line[stat_line.rindex(")") + 2 :].split()
+        return len(fields) > 1 and int(fields[1]) == os.getpid()
+    except (OSError, ValueError, IndexError):
+        return False
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
@@ -1099,14 +1112,45 @@ def _record_task_failure(
         return True
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
-    """Record the spawned child's pid + emit a ``spawned`` event carrying it."""
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+) -> bool:
+    """Persist PID, using exact run/claim CAS for lifecycle dispatches."""
+    pid = int(pid)
+    if pid <= 0:
+        return False
+    if expected_run_id is None and expected_claim_lock is None:
+        with _kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, task_id))
+            run_id = _kb._current_run_id(conn, task_id)
+            if run_id is not None:
+                conn.execute("UPDATE task_runs SET worker_pid=? WHERE id=?", (pid, run_id))
+            _kb._append_event(conn, task_id, "spawned", {"pid": pid}, run_id=run_id)
+        return True
+    if expected_run_id is None or not expected_claim_lock:
+        return False
     with _kb.write_txn(conn):
-        conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (int(pid), task_id))
-        run_id = _kb._current_run_id(conn, task_id)
-        if run_id is not None:
-            conn.execute("UPDATE task_runs SET worker_pid = ? WHERE id = ?", (int(pid), run_id))
-        _kb._append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        changed = conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=? AND status='running' "
+            "AND current_run_id=? AND claim_lock=? AND worker_pid IS NULL",
+            (pid, task_id, int(expected_run_id), expected_claim_lock),
+        )
+        if changed.rowcount != 1:
+            return False
+        run_changed = conn.execute(
+            "UPDATE task_runs SET worker_pid=? WHERE id=? AND task_id=? "
+            "AND ended_at IS NULL AND claim_lock=? AND worker_pid IS NULL",
+            (pid, int(expected_run_id), task_id, expected_claim_lock),
+        )
+        if run_changed.rowcount != 1:
+            raise RuntimeError("worker PID run binding failed")
+        _kb._append_event(conn, task_id, "spawned", {"pid": pid}, run_id=int(expected_run_id))
+    return True
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -1511,7 +1555,12 @@ def _dispatch_lane_task(
     task_id = row["id"]
     from hermes_cli import kanban_theseus_lifecycle as _theseus_lifecycle
 
-    lifecycle_ok, lifecycle_reason = _theseus_lifecycle.enforce_dispatch_preflight(conn, task_id)
+    lifecycle_check = (
+        _theseus_lifecycle.dispatch_preflight
+        if dry_run
+        else _theseus_lifecycle.enforce_dispatch_preflight
+    )
+    lifecycle_ok, lifecycle_reason = lifecycle_check(conn, task_id)
     if not lifecycle_ok:
         result.skipped_lifecycle.append((task_id, lifecycle_reason or "lifecycle_preflight_failed"))
         return False
@@ -1591,11 +1640,34 @@ def _dispatch_lane_task(
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
-        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
-        if pid:
-            _set_worker_pid(conn, claimed.id, int(pid))
+        raw_pid = _call_spawn_fn(
+            spawn_fn if spawn_fn is not None else _default_spawn,
+            claimed,
+            str(workspace),
+            board,
+        )
+        lifecycle_dispatch = claimed.workflow_template_id == _theseus_lifecycle.WORKFLOW_TEMPLATE_ID
+        pid = int(raw_pid or 0)
+        run_id = claimed.current_run_id
+        claim_lock = claimed.claim_lock
+        if lifecycle_dispatch:
+            if pid <= 0:
+                raise RuntimeError("lifecycle dispatch requires a positive worker PID")
+            bound = _set_worker_pid(
+                conn,
+                claimed.id,
+                pid,
+                expected_run_id=run_id,
+                expected_claim_lock=claim_lock,
+            )
+            if not bound:
+                if _is_verified_new_child(pid):
+                    _terminate_reclaimed_worker(pid, claim_lock)
+                raise RuntimeError("worker PID could not be bound to the exact run and claim")
+        elif pid > 0:
+            _set_worker_pid(conn, claimed.id, pid)
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
-        _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
+        _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), raw_pid, board=board)
         # consecutive_failures is deliberately NOT reset here: resetting on
         # spawn would let a task that keeps timing out loop forever. Cleared
         # only on successful completion (complete_task).

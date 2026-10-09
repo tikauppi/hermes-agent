@@ -1244,7 +1244,6 @@ def _cmd_lifecycle(args: argparse.Namespace) -> int:
                 args.task_id,
                 approval_ref=args.approval_ref,
                 approved_at=args.approved_at,
-                now=args.now,
             )
             result = {"approved": approved, "task_id": args.task_id}
     if _json_out(args, result):

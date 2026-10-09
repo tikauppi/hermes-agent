@@ -140,7 +140,6 @@ _LIFECYCLE_SPECS = [
         _TASK_ID,
         _arg("--approval-ref", required=True, help="Immutable terminal approval receipt/reference"),
         _arg("--approved-at", required=True, type=int, help="Approval receipt epoch timestamp"),
-        _arg("--now", type=int, help="Evaluation epoch timestamp (test/replay; default: current time)"),
         _json_flag(),
     ], help="Approve a pre-dispatch task without bypassing its expiry"),
 ]

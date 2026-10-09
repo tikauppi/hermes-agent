@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -22,6 +24,22 @@ def lifecycle_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(glh.time, "time", lambda: 110)
+    monkeypatch.setattr(
+        glh,
+        "_read_git_identity",
+        lambda path: {
+            "root": str(Path(path).resolve()),
+            "branch": {
+                "builder-wt": "pilot/builder",
+                "reviewer-wt": "pilot/reviewer",
+                "investigator-wt": "pilot/investigator",
+            }.get(Path(path).name, "pilot/builder"),
+            "head": "b" * 40,
+            "parent": "a" * 40,
+        },
+        raising=False,
+    )
     monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda _profile: True)
     monkeypatch.setattr(
         kbd._kbw,
@@ -46,7 +64,6 @@ def _builder(conn, tmp_path: Path, *, expires_at: int = 200):
         branch="pilot/builder",
         worktree=str(worktree),
         approval_expires_at=expires_at,
-        now=100,
     )
 
 
@@ -63,7 +80,7 @@ def test_glh_01_and_03_stable_task_new_run_and_approval_gate(lifecycle_db):
     assert task.worker_pid is None
 
     assert glh.record_terminal_approval(
-        conn, task_id, approval_ref="terminal:receipt-1", approved_at=110, now=110
+        conn, task_id, approval_ref="terminal:receipt-1", approved_at=110
     )
     first = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 41001)
     assert [item[0] for item in first.spawned] == [task_id]
@@ -107,12 +124,189 @@ def test_glh_01_and_03_stable_task_new_run_and_approval_gate(lifecycle_db):
     assert len(kb.list_runs(conn, task_id)) == 2
 
 
-def test_glh_03_expired_approval_never_creates_run_or_pid(lifecycle_db):
+def test_native_completion_finalizes_exact_run_and_phase(lifecycle_db):
     conn, tmp_path = lifecycle_db
+    task_id = _builder(conn, tmp_path)
+    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:complete", approved_at=101)
+    assert kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 41101).spawned
+    task = kb.get_task(conn, task_id)
+    assert task is not None and task.current_run_id is not None
+    run_id = task.current_run_id
+    run = kb.list_runs(conn, task_id)[0]
+    Path(run.metadata["artifacts"]["report"]).write_text("report\n", encoding="utf-8")
+    Path(run.metadata["artifacts"]["result"]).write_text("result\n", encoding="utf-8")
+
+    assert kb.complete_task(conn, task_id, expected_run_id=run_id)
+
+    completed = kb.get_task(conn, task_id)
+    assert completed is not None
+    assert completed.current_step_key == glh.BUILDER_COMPLETE_AWAITING_REVIEW
+    terminal_run = kb.list_runs(conn, task_id)[0]
+    assert terminal_run.ended_at is not None
+    assert terminal_run.metadata["theseus_artifacts"]["artifacts"]["report"]["sha256"]
+    assert terminal_run.metadata["theseus_artifacts"]["artifacts"]["result"]["sha256"]
+
+
+def test_native_request_review_finalizes_exact_run_and_phase(lifecycle_db):
+    conn, tmp_path = lifecycle_db
+    task_id = _builder(conn, tmp_path)
+    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:review", approved_at=101)
+    assert kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 41102).spawned
+    task = kb.get_task(conn, task_id)
+    assert task is not None and task.current_run_id is not None
+    run_id = task.current_run_id
+    run = kb.list_runs(conn, task_id)[0]
+    assert isinstance(run.metadata, dict)
+    Path(run.metadata["artifacts"]["report"]).write_text("review report\n", encoding="utf-8")
+    Path(run.metadata["artifacts"]["result"]).write_text("review result\n", encoding="utf-8")
+
+    assert kb.request_review(conn, task_id, expected_run_id=run_id)
+
+    reviewed = kb.get_task(conn, task_id)
+    assert reviewed is not None
+    assert reviewed.current_step_key == glh.BUILDER_COMPLETE_AWAITING_REVIEW
+    terminal_run = kb.list_runs(conn, task_id)[0]
+    assert terminal_run.outcome == "review_requested"
+    assert isinstance(terminal_run.metadata, dict)
+    assert terminal_run.metadata["theseus_artifacts"]["run_id"] == run_id
+    assert terminal_run.metadata["theseus_artifacts"]["artifacts"]["report"]["sha256"]
+
+
+def test_native_request_changes_finalizes_exact_reviewer_run(lifecycle_db):
+    conn, tmp_path = lifecycle_db
+    builder_id = _builder(conn, tmp_path)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (builder_id,))
+    reviewer_path = tmp_path / "reviewer-wt"
+    reviewer_path.mkdir()
+    reviewer_id = glh.create_role_task(
+        conn,
+        builder_task_id=builder_id,
+        role="reviewer",
+        title="Native review changes",
+        candidate_sha="b" * 40,
+        branch="pilot/reviewer",
+        worktree=str(reviewer_path),
+    )
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (reviewer_id,))
+        kb._append_event(
+            conn,
+            reviewer_id,
+            "review_requested",
+            {"implementer": "theseus-builder", "reviewer": "theseus-reviewer"},
+        )
+    assert kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 41103).spawned
+    task = kb.get_task(conn, reviewer_id)
+    assert task is not None and task.current_run_id is not None
+    run_id = task.current_run_id
+    run = kb.list_runs(conn, reviewer_id)[0]
+    assert isinstance(run.metadata, dict)
+    Path(run.metadata["artifacts"]["report"]).write_text("change report\n", encoding="utf-8")
+    Path(run.metadata["artifacts"]["result"]).write_text("change result\n", encoding="utf-8")
+
+    changed, _implementer = kb.request_changes(
+        conn, reviewer_id, reason="correct this", expected_run_id=run_id
+    )
+
+    assert changed
+    reviewed = kb.get_task(conn, reviewer_id)
+    assert reviewed is not None and reviewed.current_step_key == glh.CHANGES_REQUESTED
+    terminal_run = kb.list_runs(conn, reviewer_id)[0]
+    assert terminal_run.outcome == "changes_requested"
+    assert isinstance(terminal_run.metadata, dict)
+    assert terminal_run.metadata["theseus_artifacts"]["run_id"] == run_id
+    assert terminal_run.metadata["theseus_artifacts"]["artifacts"]["result"]["sha256"]
+
+
+@pytest.mark.parametrize(
+    ("role", "worktree_name", "branch", "pid", "expected_phase"),
+    [
+        ("reviewer", "reviewer-wt", "pilot/reviewer", 41104, glh.GATE2_RECOMMENDATION_READY),
+        ("investigator", "investigator-wt", "pilot/investigator", 41105, glh.CORRECTION_READY),
+    ],
+)
+def test_native_role_completion_finalizes_run_hashes(
+    lifecycle_db, role, worktree_name, branch, pid, expected_phase
+):
+    conn, tmp_path = lifecycle_db
+    builder_id = _builder(conn, tmp_path)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (builder_id,))
+    role_path = tmp_path / worktree_name
+    role_path.mkdir()
+    role_id = glh.create_role_task(
+        conn,
+        builder_task_id=builder_id,
+        role=role,
+        title=f"Native {role} completion",
+        candidate_sha="b" * 40,
+        branch=branch,
+        worktree=str(role_path),
+        authorization_ref="architect:investigate" if role == "investigator" else None,
+    )
+    assert kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: pid).spawned
+    task = kb.get_task(conn, role_id)
+    assert task is not None and task.current_run_id is not None
+    run_id = task.current_run_id
+    run = kb.list_runs(conn, role_id)[0]
+    assert isinstance(run.metadata, dict)
+    Path(run.metadata["artifacts"]["report"]).write_text(f"{role} report\n", encoding="utf-8")
+    Path(run.metadata["artifacts"]["result"]).write_text(f"{role} result\n", encoding="utf-8")
+
+    assert kb.complete_task(conn, role_id, expected_run_id=run_id)
+
+    completed = kb.get_task(conn, role_id)
+    assert completed is not None and completed.current_step_key == expected_phase
+    terminal_run = kb.list_runs(conn, role_id)[0]
+    assert terminal_run.ended_at is not None
+    assert isinstance(terminal_run.metadata, dict)
+    assert terminal_run.metadata["theseus_artifacts"]["run_id"] == run_id
+    assert terminal_run.metadata["theseus_artifacts"]["artifacts"]["report"]["sha256"]
+    assert terminal_run.metadata["theseus_artifacts"]["artifacts"]["result"]["sha256"]
+
+
+def test_builder_creation_has_no_caller_controlled_clock():
+    assert "now" not in inspect.signature(glh.create_builder_task).parameters
+
+
+def test_concurrent_builder_creation_has_one_durable_identity(lifecycle_db):
+    conn, tmp_path = lifecycle_db
+    worktree = tmp_path / "concurrent-builder"
+    worktree.mkdir()
+
+    def create(_index):
+        with kbc.connect_closing(board="default") as worker_conn:
+            return glh.create_builder_task(
+                worker_conn,
+                package_id="pkg-concurrent",
+                title="Concurrent Builder",
+                baseline_sha="a" * 40,
+                candidate_sha="b" * 40,
+                branch="pilot/concurrent",
+                worktree=str(worktree),
+                approval_expires_at=200,
+            )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        ids = list(pool.map(create, range(16)))
+
+    assert len(set(ids)) == 1
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key=? AND status != 'archived'",
+        ("theseus-work-package:pkg-concurrent:builder",),
+    ).fetchall()
+    assert [row["id"] for row in rows] == [ids[0]]
+
+
+def test_glh_03_expired_approval_never_creates_run_or_pid(lifecycle_db, monkeypatch):
+    conn, tmp_path = lifecycle_db
+    monkeypatch.setattr(glh.time, "time", lambda: 100)
     task_id = _builder(conn, tmp_path, expires_at=105)
+    monkeypatch.setattr(glh.time, "time", lambda: 110)
 
     assert not glh.record_terminal_approval(
-        conn, task_id, approval_ref="terminal:late", approved_at=106, now=106
+        conn, task_id, approval_ref="terminal:late", approved_at=106
     )
     result = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 99999)
 
@@ -124,12 +318,36 @@ def test_glh_03_expired_approval_never_creates_run_or_pid(lifecycle_db):
     assert kb.list_runs(conn, task_id) == []
     assert any(event.kind == "theseus_approval_expired" for event in kb.list_events(conn, task_id))
 
+    assert glh.issue_fresh_terminal_approval(
+        conn,
+        task_id,
+        approval_ref="terminal:fresh-after-expiry",
+        approved_at=110,
+        approval_expires_at=200,
+    )
+    fresh = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 99998)
+    assert [item[0] for item in fresh.spawned] == [task_id]
+
+
+def test_native_claim_unblock_and_promote_cannot_bypass_terminal_approval(lifecycle_db):
+    conn, tmp_path = lifecycle_db
+    task_id = _builder(conn, tmp_path)
+
+    assert not kb.unblock_task(conn, task_id)
+    promoted, reason = kb.promote_task(conn, task_id, actor="operator", force=True)
+    assert not promoted
+    assert reason == "THESEUS lifecycle gate requires terminal approval"
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+    assert kb.claim_task(conn, task_id) is None
+    assert kb.list_runs(conn, task_id) == []
+
 
 def test_generic_unblock_cannot_bypass_lifecycle_approval(lifecycle_db):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
-    assert kb.unblock_task(conn, task_id)
 
+    assert not kb.unblock_task(conn, task_id)
     result = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 99999)
 
     assert result.spawned == []
@@ -137,13 +355,13 @@ def test_generic_unblock_cannot_bypass_lifecycle_approval(lifecycle_db):
     task = kb.get_task(conn, task_id)
     assert task.status == "blocked"
     assert task.current_step_key == glh.AWAITING_TERMINAL_APPROVAL
-    assert any(event.kind == "theseus_dispatch_blocked" for event in kb.list_events(conn, task_id))
+    assert not any(event.kind == "spawned" for event in kb.list_events(conn, task_id))
 
 
 def test_glh_02_resume_requires_specific_architect_decision(lifecycle_db):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
-    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:ok", approved_at=101, now=101)
+    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:ok", approved_at=101)
     kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 42001)
     run_id = kb.get_task(conn, task_id).current_run_id
     glh.stop_for_architect(
@@ -165,6 +383,44 @@ def test_glh_02_resume_requires_specific_architect_decision(lifecycle_db):
     assert len(kb.list_runs(conn, task_id)) == 1
 
 
+def test_resume_rejects_forged_actor_and_actual_git_mismatch(lifecycle_db, monkeypatch):
+    conn, tmp_path = lifecycle_db
+    task_id = _builder(conn, tmp_path)
+    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:stop", approved_at=101)
+    kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 42011)
+    run_id = kb.get_task(conn, task_id).current_run_id
+    assert run_id is not None
+    assert glh.stop_for_architect(
+        conn,
+        task_id,
+        expected_run_id=run_id,
+        stop_type="scope",
+        reason="decision",
+        decision_questions=["continue?"],
+        forbidden_actions=["do not dispatch"],
+        baseline_sha="a" * 40,
+        candidate_sha="b" * 40,
+    )
+    with pytest.raises(ValueError, match="Architect authority"):
+        glh.resume_after_architect_decision(
+            conn, task_id, decision_ref="forged", actor="builder"
+        )
+    monkeypatch.setattr(
+        glh,
+        "_read_git_identity",
+        lambda _path: {
+            "root": str(tmp_path / "builder-wt"),
+            "branch": "wrong/branch",
+            "head": "c" * 40,
+            "parent": "a" * 40,
+        },
+    )
+    with pytest.raises(ValueError, match="Git identity"):
+        glh.resume_after_architect_decision(
+            conn, task_id, decision_ref="architect:exact-stop", actor="architect"
+        )
+
+
 def test_legacy_task_dispatch_is_unchanged(lifecycle_db):
     conn, _ = lifecycle_db
     task_id = kb.create_task(conn, title="legacy", assignee="worker")
@@ -173,10 +429,10 @@ def test_legacy_task_dispatch_is_unchanged(lifecycle_db):
     assert kb.get_task(conn, task_id).workflow_template_id is None
 
 
-def test_glh_04_and_05_crash_recovery_never_duplicates_live_attempt(lifecycle_db, monkeypatch):
+def test_glh_04_and_05_crash_recovery_requires_fresh_approval(lifecycle_db, monkeypatch):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
-    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:ok", approved_at=101, now=101)
+    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:ok", approved_at=101)
     assert len(kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 45001).spawned) == 1
     first_run = kb.get_task(conn, task_id).current_run_id
 
@@ -185,19 +441,23 @@ def test_glh_04_and_05_crash_recovery_never_duplicates_live_attempt(lifecycle_db
     recovered = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 45002)
 
     assert recovered.crashed == [task_id]
-    assert [item[0] for item in recovered.spawned] == [task_id]
+    assert recovered.spawned == []
     task = kb.get_task(conn, task_id)
-    assert task.current_run_id != first_run
-    assert task.worker_pid == 45002
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.current_step_key == glh.AWAITING_TERMINAL_APPROVAL
+    assert task.current_run_id is None
+    assert task.worker_pid is None
     runs = kb.list_runs(conn, task_id)
-    assert len([run for run in runs if run.ended_at is None]) == 1
-    assert any(run.outcome == "crashed" for run in runs)
+    assert len(runs) == 1
+    assert runs[0].id == first_run
+    assert runs[0].outcome == "crashed"
 
 
 def test_glh_06_two_dispatch_ticks_create_one_run(lifecycle_db):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
-    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:ok", approved_at=101, now=101)
+    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:ok", approved_at=101)
     calls = []
 
     first = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: calls.append(task_id) or 46001)
@@ -213,7 +473,7 @@ def test_isolated_pilot_uses_synthetic_subprocess_and_run_readback(lifecycle_db)
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
     assert glh.record_terminal_approval(
-        conn, task_id, approval_ref="terminal:pilot", approved_at=101, now=101
+        conn, task_id, approval_ref="terminal:pilot", approved_at=101
     )
     workers: list[subprocess.Popen] = []
 
@@ -289,6 +549,7 @@ def test_glh_07_reviewer_and_investigator_use_separate_linked_worktrees(lifecycl
         candidate_sha="b" * 40,
         branch="pilot/investigator",
         worktree=str(investigator_path),
+        authorization_ref="architect:synthetic-investigation",
     )
 
     assert len({builder_id, reviewer_id, investigator_id}) == 3
@@ -298,6 +559,69 @@ def test_glh_07_reviewer_and_investigator_use_separate_linked_worktrees(lifecycl
     assert kb.parent_ids(conn, reviewer_id) == [builder_id]
     assert kb.parent_ids(conn, investigator_id) == [builder_id]
     assert all(glh.package_metadata(conn, task.id)["candidate_sha"] == "b" * 40 for task in role_tasks)
+
+
+def test_role_candidate_collision_and_nonconcurrency_are_enforced(lifecycle_db, monkeypatch):
+    conn, tmp_path = lifecycle_db
+    builder_id = _builder(conn, tmp_path)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (builder_id,))
+    reviewer_path = tmp_path / "reviewer-guard-wt"
+    investigator_path = tmp_path / "investigator-guard-wt"
+    reviewer_path.mkdir()
+    investigator_path.mkdir()
+
+    with pytest.raises(ValueError, match="candidate"):
+        glh.create_role_task(
+            conn,
+            builder_task_id=builder_id,
+            role="reviewer",
+            title="mismatch",
+            candidate_sha="c" * 40,
+            branch="pilot/reviewer-guard",
+            worktree=str(reviewer_path),
+        )
+
+    def identity(path):
+        path = str(Path(path).resolve())
+        branch = "pilot/reviewer-guard" if path == str(reviewer_path) else "pilot/investigator-guard"
+        return {"root": path, "branch": branch, "head": "b" * 40, "parent": "a" * 40}
+
+    monkeypatch.setattr(glh, "_read_git_identity", identity)
+    reviewer_id = glh.create_role_task(
+        conn,
+        builder_task_id=builder_id,
+        role="reviewer",
+        title="review",
+        candidate_sha="b" * 40,
+        branch="pilot/reviewer-guard",
+        worktree=str(reviewer_path),
+    )
+    with pytest.raises(ValueError, match="worktree|branch"):
+        glh.create_role_task(
+            conn,
+            builder_task_id=builder_id,
+            role="investigator",
+            title="collision",
+            candidate_sha="b" * 40,
+            branch="pilot/reviewer-guard",
+            worktree=str(reviewer_path),
+            authorization_ref="architect:investigate",
+        )
+    investigator_id = glh.create_role_task(
+        conn,
+        builder_task_id=builder_id,
+        role="investigator",
+        title="investigation",
+        candidate_sha="b" * 40,
+        branch="pilot/investigator-guard",
+        worktree=str(investigator_path),
+        authorization_ref="architect:investigate",
+    )
+    first = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 49101, max_spawn=1)
+    assert [item[0] for item in first.spawned] == [reviewer_id]
+    second = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 49102)
+    assert not [item for item in second.spawned if item[0] == investigator_id]
 
 
 def test_glh_08_run_artifacts_are_distinct_hashed_and_collision_guarded(lifecycle_db):
@@ -318,6 +642,108 @@ def test_glh_08_run_artifacts_are_distinct_hashed_and_collision_guarded(lifecycl
         glh.finalize_artifacts(paths)
 
 
+def test_artifacts_reject_traversal_symlink_and_replacement(lifecycle_db):
+    _conn, tmp_path = lifecycle_db
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        glh.run_artifact_paths(linked_parent / "runs", "board", "task-1", 1)
+
+    root = tmp_path / "secure-runs"
+    with pytest.raises(ValueError, match="component"):
+        glh.run_artifact_paths(root, "../escape", "task-1", 1)
+
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "linked").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        glh.run_artifact_paths(root, "linked", "task-1", 1)
+
+    paths = glh.run_artifact_paths(root, "board", "task-1", 2)
+    report = Path(paths["report"])
+    report.write_text("original", encoding="utf-8")
+    report.unlink()
+    secret = tmp_path / "secret"
+    secret.write_text("do not hash", encoding="utf-8")
+    report.symlink_to(secret)
+    with pytest.raises(ValueError, match="replaced|symlink"):
+        glh.finalize_artifacts(paths)
+
+
+def test_missing_pid_and_pid_bind_failure_are_not_reported_as_spawned(lifecycle_db, monkeypatch):
+    conn, tmp_path = lifecycle_db
+    task_id = _builder(conn, tmp_path)
+    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:pid", approved_at=101)
+
+    missing = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 0)
+    assert missing.spawned == []
+    missing_task = kb.get_task(conn, task_id)
+    assert missing_task is not None
+    assert missing_task.worker_pid is None
+    assert not [run for run in kb.list_runs(conn, task_id) if run.ended_at is None]
+
+    # A distinct fresh receipt is required for the retry.
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status='blocked', current_step_key=?, block_kind='approval' WHERE id=?",
+            (glh.AWAITING_TERMINAL_APPROVAL, task_id),
+        )
+    glh.issue_fresh_terminal_approval(
+        conn,
+        task_id,
+        approval_ref="terminal:pid-fresh",
+        approved_at=101,
+        approval_expires_at=200,
+    )
+    terminated = []
+    monkeypatch.setattr(kbd, "_set_worker_pid", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(kbd, "_is_verified_new_child", lambda pid: pid == 49001)
+    monkeypatch.setattr(
+        kbd,
+        "_terminate_reclaimed_worker",
+        lambda pid, claim_lock: terminated.append((pid, claim_lock)) or {"terminated": True},
+    )
+    failed = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 49001)
+    assert failed.spawned == []
+    assert terminated and terminated[0][0] == 49001
+
+
+def test_pid_bind_failure_does_not_kill_unverified_process(lifecycle_db, monkeypatch):
+    conn, tmp_path = lifecycle_db
+    task_id = _builder(conn, tmp_path)
+    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:pid-safe", approved_at=101)
+    terminated = []
+    monkeypatch.setattr(kbd, "_set_worker_pid", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(kbd, "_is_verified_new_child", lambda _pid: False)
+    monkeypatch.setattr(
+        kbd,
+        "_terminate_reclaimed_worker",
+        lambda pid, claim_lock: terminated.append((pid, claim_lock)) or {"terminated": True},
+    )
+
+    failed = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 49002)
+
+    assert failed.spawned == []
+    assert terminated == []
+
+
+def test_lifecycle_dry_run_is_byte_for_byte_non_mutating(lifecycle_db):
+    conn, tmp_path = lifecycle_db
+    task_id = _builder(conn, tmp_path)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+    before = "\n".join(conn.iterdump())
+
+    result = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 99999, dry_run=True)
+
+    after = "\n".join(conn.iterdump())
+    assert result.spawned == []
+    assert before == after
+
+
 def test_glh_09_dispatcher_policy_validation_is_opt_in_and_non_mutating():
     legacy = {"dispatch_in_gateway": False}
     before = json.dumps(legacy, sort_keys=True)
@@ -333,10 +759,34 @@ def test_glh_09_dispatcher_policy_validation_is_opt_in_and_non_mutating():
         glh.validate_dispatcher_host("theseus-reviewer", enabled)
 
 
+def test_gateway_boot_enforces_designated_lifecycle_host(monkeypatch, tmp_path):
+    from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+    from hermes_cli import config as hermes_config
+
+    monkeypatch.setenv("HERMES_PROFILE", "theseus-reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "theseus_lifecycle": {
+                    "enabled": True,
+                    "dispatcher_profile": "theseus-builder",
+                },
+            }
+        },
+    )
+    runner = GatewayKanbanWatchersMixin()
+    assert runner._kanban_dispatcher_boot() is None
+    assert getattr(runner, "_kanban_dispatcher_lock_handle", None) is None
+
+
 def test_glh_10_stop_wins_over_late_heartbeat_and_recovery(lifecycle_db):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
-    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:ok", approved_at=101, now=101)
+    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:ok", approved_at=101)
     kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 47001)
     run_id = kb.get_task(conn, task_id).current_run_id
     assert glh.stop_for_architect(
@@ -358,10 +808,45 @@ def test_glh_10_stop_wins_over_late_heartbeat_and_recovery(lifecycle_db):
     assert len(kb.list_runs(conn, task_id)) == 1
 
 
+def test_stop_is_one_fenced_transaction_without_unblock_gap(lifecycle_db, monkeypatch):
+    conn, tmp_path = lifecycle_db
+    task_id = _builder(conn, tmp_path)
+    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:race", approved_at=101)
+    kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 47011)
+    task = kb.get_task(conn, task_id)
+    assert task is not None and task.current_run_id is not None
+    run_id = task.current_run_id
+    original = kb.block_task
+    raced = []
+
+    def interleaving_block(*args, **kwargs):
+        result = original(*args, **kwargs)
+        raced.append(kb.unblock_task(conn, task_id))
+        return result
+
+    monkeypatch.setattr(kb, "block_task", interleaving_block)
+    assert glh.stop_for_architect(
+        conn,
+        task_id,
+        expected_run_id=run_id,
+        stop_type="race",
+        reason="fence",
+        decision_questions=["continue?"],
+        forbidden_actions=["no retry"],
+        baseline_sha="a" * 40,
+        candidate_sha="b" * 40,
+    )
+    stopped = kb.get_task(conn, task_id)
+    assert raced == []
+    assert stopped is not None and stopped.status == "blocked"
+    assert stopped.current_step_key == glh.STOPPED_AWAITING_ARCHITECT
+    assert stopped.current_run_id is None
+
+
 def test_glh_11_stop_payload_is_redacted(lifecycle_db):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
-    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:ok", approved_at=101, now=101)
+    glh.record_terminal_approval(conn, task_id, approval_ref="terminal:ok", approved_at=101)
     kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 48001)
     run_id = kb.get_task(conn, task_id).current_run_id
     secret = "ghp_" + ("x" * 40)
@@ -412,11 +897,12 @@ def test_lifecycle_cli_show_and_approve_use_active_board(lifecycle_db):
     shown = json.loads(kc.run_slash(f"lifecycle show {task_id} --json"))
     assert shown["task_id"] == task_id
     assert shown["phase"] == glh.AWAITING_TERMINAL_APPROVAL
+    assert shown["dispatch_diagnostic"]["reason"] == "approval_blocked"
 
     approved = json.loads(
         kc.run_slash(
             f"lifecycle approve {task_id} --approval-ref terminal:cli-1 "
-            "--approved-at 101 --now 101 --json"
+            "--approved-at 101 --json"
         )
     )
     assert approved == {"approved": True, "task_id": task_id}

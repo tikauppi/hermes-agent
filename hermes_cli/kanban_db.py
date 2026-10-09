@@ -2139,6 +2139,10 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        from hermes_cli import kanban_theseus_lifecycle as _theseus_lifecycle
+        if not _theseus_lifecycle.native_claim_allowed_locked(conn, task_id):
+            _append_event(conn, task_id, "claim_rejected", {"reason": "theseus_lifecycle_gate"})
+            return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2156,6 +2160,7 @@ def claim_task(
         run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
         if run_id is None:
             return None
+        _theseus_lifecycle.bind_claim_authority_locked(conn, task_id, run_id)
         claimed = get_task(conn, task_id)
     _fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
     return claimed
@@ -2172,6 +2177,10 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        from hermes_cli import kanban_theseus_lifecycle as _theseus_lifecycle
+        if not _theseus_lifecycle.native_claim_allowed_locked(conn, task_id):
+            _append_event(conn, task_id, "claim_rejected", {"reason": "theseus_lifecycle_gate"})
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -2188,6 +2197,7 @@ def claim_review_task(
         )
         if run_id is None:
             return None
+        _theseus_lifecycle.bind_claim_authority_locked(conn, task_id, run_id)
         return get_task(conn, task_id)
 
 
@@ -2561,6 +2571,10 @@ def complete_task(
             return False
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
+        from hermes_cli import kanban_theseus_lifecycle as _theseus_lifecycle
+        metadata = _theseus_lifecycle.prepare_native_terminal_locked(
+            conn, task_id, expected_run_id, "complete", metadata
+        )
         prior_status = _task_status(conn, task_id)
         sql = """
                 UPDATE tasks
@@ -3044,6 +3058,10 @@ def request_review(
                     "malformed); pass reviewer= explicitly",
                 )
         reviewer = _canonical_assignee(reviewer)
+        from hermes_cli import kanban_theseus_lifecycle as _theseus_lifecycle
+        metadata = _theseus_lifecycle.prepare_native_terminal_locked(
+            conn, task_id, expected_run_id, "review", metadata
+        )
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
         params: tuple[Any, ...] = (
@@ -3139,6 +3157,10 @@ def request_changes(
         if implementer is None:
             return False, "review handoff has no valid implementer provenance"
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
+        from hermes_cli import kanban_theseus_lifecycle as _theseus_lifecycle
+        terminal_metadata = _theseus_lifecycle.prepare_native_terminal_locked(
+            conn, task_id, int(current_run_id), "changes"
+        )
 
         new_status = _landing_status_after_parents(conn, task_id)
         # consecutive_failures deliberately PRESERVED: a review transition is
@@ -3158,7 +3180,12 @@ def request_changes(
         if cur.rowcount != 1:
             return False, "task changed during review handoff"
         run_id = _end_run(
-            conn, task_id, outcome="changes_requested", status=new_status, summary=reason,
+            conn,
+            task_id,
+            outcome="changes_requested",
+            status=new_status,
+            summary=reason,
+            metadata=terminal_metadata,
         )
         _append_event(
             conn,
@@ -3182,6 +3209,9 @@ def promote_task(
     """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event.
     Refused while a parent is unfinished unless ``force``; ``dry_run`` only
     validates. Returns ``(ok, reason)``."""
+    from hermes_cli import kanban_theseus_lifecycle as _theseus_lifecycle
+    if not _theseus_lifecycle.native_promotion_allowed_locked(conn, task_id):
+        return False, "THESEUS lifecycle gate requires terminal approval"
     cur_status = _task_status(conn, task_id)
     if cur_status is None:
         return False, f"task {task_id} not found"
@@ -3257,6 +3287,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     when that is where it left off), closing any leaked run first."""
     now = int(time.time())
     with write_txn(conn):
+        from hermes_cli import kanban_theseus_lifecycle as _theseus_lifecycle
+        if not _theseus_lifecycle.native_promotion_allowed_locked(conn, task_id):
+            return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) == "blocked"

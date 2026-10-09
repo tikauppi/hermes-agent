@@ -12,6 +12,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -140,7 +141,6 @@ def create_builder_task(
     branch: str,
     worktree: str,
     approval_expires_at: int,
-    now: Optional[int] = None,
 ) -> str:
     """Create one stable Builder card, initially blocked before any attempt."""
     package_id = _require_text("package_id", package_id)
@@ -148,35 +148,40 @@ def create_builder_task(
     candidate_sha = _require_sha("candidate_sha", candidate_sha)
     branch = _require_text("branch", branch)
     worktree = _require_worktree(worktree)
-    now = int(time.time() if now is None else now)
+    now = int(time.time())
     expires_at = int(approval_expires_at)
     if expires_at <= now:
         raise ValueError("approval_expires_at must be in the future")
-    task_id = kb.create_task(
-        conn,
-        title=title,
-        assignee=ROLE_PROFILES["builder"],
-        workspace_kind="worktree",
-        workspace_path=worktree,
-        branch_name=branch,
-        initial_status="blocked",
-        idempotency_key=f"theseus-work-package:{package_id}:builder",
-        created_by="theseus-lifecycle",
-    )
-    task = kb.get_task(conn, task_id)
-    if task is not None and task.workflow_template_id == WORKFLOW_TEMPLATE_ID:
-        return task_id
-    metadata = {
-        "package_id": package_id,
-        "role": "builder",
-        "baseline_sha": baseline_sha,
-        "candidate_sha": candidate_sha,
-        "branch": branch,
-        "worktree": worktree,
-        "approval_expires_at": expires_at,
-        "dispatcher_profile": DESIGNATED_DISPATCHER_PROFILE,
-    }
+    idempotency_key = f"theseus-work-package:{package_id}:builder"
     with kb.write_txn(conn):
+        existing = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key=? AND status != 'archived' "
+            "ORDER BY created_at, id LIMIT 1",
+            (idempotency_key,),
+        ).fetchone()
+        if existing is not None:
+            return existing["id"]
+        task_id = kb.create_task(
+            conn,
+            title=title,
+            assignee=ROLE_PROFILES["builder"],
+            workspace_kind="worktree",
+            workspace_path=worktree,
+            branch_name=branch,
+            initial_status="blocked",
+            idempotency_key=idempotency_key,
+            created_by="theseus-lifecycle",
+        )
+        metadata = {
+            "package_id": package_id,
+            "role": "builder",
+            "baseline_sha": baseline_sha,
+            "candidate_sha": candidate_sha,
+            "branch": branch,
+            "worktree": worktree,
+            "approval_expires_at": expires_at,
+            "dispatcher_profile": DESIGNATED_DISPATCHER_PROFILE,
+        }
         conn.execute(
             "UPDATE tasks SET workflow_template_id=?, current_step_key=?, block_kind='approval' WHERE id=?",
             (WORKFLOW_TEMPLATE_ID, AWAITING_TERMINAL_APPROVAL, task_id),
@@ -197,17 +202,18 @@ def record_terminal_approval(
     *,
     approval_ref: str,
     approved_at: int,
-    now: Optional[int] = None,
 ) -> bool:
+    """Record a task-bound, one-use terminal receipt using trusted wall time."""
     approval_ref = kb.redact_review_value(_require_text("approval_ref", approval_ref))
     task = kb.get_task(conn, task_id)
     metadata = package_metadata(conn, task_id)
     if task is None or metadata is None or task.current_step_key != AWAITING_TERMINAL_APPROVAL:
         raise ValueError("task is not awaiting terminal approval")
     approved_at = int(approved_at)
-    now = int(time.time() if now is None else now)
-    expires_at = int(metadata["approval_expires_at"])
-    if approved_at > expires_at or now > expires_at:
+    now = int(time.time())
+    window = _event_payload(conn, task_id, "theseus_approval_window_renewed") or metadata
+    expires_at = int(window["approval_expires_at"])
+    if approved_at > now or approved_at > expires_at or now > expires_at:
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='blocked', worker_pid=NULL WHERE id=?", (task_id,))
             kb._append_event(
@@ -217,9 +223,19 @@ def record_terminal_approval(
                 {"approval_ref": approval_ref, "approved_at": approved_at, "approval_expires_at": expires_at},
             )
         return False
-    if task.current_run_id is not None or task.worker_pid is not None or kb.list_runs(conn, task_id):
-        raise ValueError("approval pre-dispatch task already has run/PID history")
+    if task.current_run_id is not None or task.worker_pid is not None:
+        raise ValueError("approval pre-dispatch task already has an active run/PID")
+    receipt_id = hashlib.sha256(
+        f"{task_id}\0{approval_ref}\0{approved_at}\0{expires_at}".encode()
+    ).hexdigest()
     with kb.write_txn(conn):
+        replay = conn.execute(
+            "SELECT 1 FROM task_events WHERE kind='theseus_terminal_approved' "
+            "AND json_extract(payload, '$.receipt_id')=? LIMIT 1",
+            (receipt_id,),
+        ).fetchone()
+        if replay is not None:
+            raise ValueError("terminal approval receipt was already issued")
         changed = conn.execute(
             "UPDATE tasks SET status='ready', current_step_key=?, block_kind=NULL "
             "WHERE id=? AND status='blocked' AND current_step_key=? AND current_run_id IS NULL AND worker_pid IS NULL",
@@ -231,9 +247,186 @@ def record_terminal_approval(
             conn,
             task_id,
             "theseus_terminal_approved",
-            {"approval_ref": approval_ref, "approved_at": approved_at, "phase": READY_FOR_BUILDER},
+            {
+                "approval_ref": approval_ref,
+                "approved_at": approved_at,
+                "approval_expires_at": expires_at,
+                "receipt_id": receipt_id,
+                "task_id": task_id,
+                "phase": READY_FOR_BUILDER,
+            },
         )
     return True
+
+
+def issue_fresh_terminal_approval(
+    conn,
+    task_id: str,
+    *,
+    approval_ref: str,
+    approved_at: int,
+    approval_expires_at: int,
+) -> bool:
+    """Issue a distinct approval window after expiry using trusted wall time."""
+    now = int(time.time())
+    approved_at = int(approved_at)
+    expires_at = int(approval_expires_at)
+    if approved_at > now or expires_at <= now or approved_at > expires_at:
+        raise ValueError("fresh approval timestamps are not currently valid")
+    task = kb.get_task(conn, task_id)
+    if task is None or task.current_step_key != AWAITING_TERMINAL_APPROVAL:
+        raise ValueError("task is not awaiting terminal approval")
+    with kb.write_txn(conn):
+        kb._append_event(
+            conn,
+            task_id,
+            "theseus_approval_window_renewed",
+            {"approval_expires_at": expires_at, "issued_at": now},
+        )
+    return record_terminal_approval(
+        conn, task_id, approval_ref=approval_ref, approved_at=approved_at
+    )
+
+
+def _approval_for_claim(conn, task_id: str) -> Optional[dict]:
+    approval = _event_payload(conn, task_id, "theseus_terminal_approved")
+    if not approval or approval.get("task_id") != task_id:
+        return None
+    receipt_id = approval.get("receipt_id")
+    if not isinstance(receipt_id, str) or int(approval.get("approval_expires_at", 0)) < int(time.time()):
+        return None
+    consumed = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id=? AND kind='theseus_approval_consumed' "
+        "AND json_extract(payload, '$.receipt_id')=? LIMIT 1",
+        (task_id, receipt_id),
+    ).fetchone()
+    return None if consumed else approval
+
+
+def _decision_for_claim(conn, task_id: str) -> Optional[dict]:
+    decision = _event_payload(conn, task_id, "theseus_architect_decision")
+    stop = _event_payload(conn, task_id, "theseus_architect_stop")
+    if not decision or not stop or decision.get("stop_token") != stop.get("stop_token"):
+        return None
+    decision_id = decision.get("decision_id")
+    if not isinstance(decision_id, str):
+        return None
+    consumed = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id=? AND kind='theseus_decision_consumed' "
+        "AND json_extract(payload, '$.decision_id')=? LIMIT 1",
+        (task_id, decision_id),
+    ).fetchone()
+    return None if consumed else decision
+
+
+def native_claim_allowed_locked(conn, task_id: str) -> bool:
+    row = conn.execute(
+        "SELECT workflow_template_id, current_step_key FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    if row is None or row["workflow_template_id"] != WORKFLOW_TEMPLATE_ID:
+        return True
+    phase = row["current_step_key"]
+    if phase == READY_FOR_BUILDER:
+        return _approval_for_claim(conn, task_id) is not None or _decision_for_claim(conn, task_id) is not None
+    if phase == BUILDER_RUNNING:
+        return _decision_for_claim(conn, task_id) is not None
+    return phase in {REVIEW_RUNNING, INVESTIGATION_RUNNING}
+
+
+def bind_claim_authority_locked(conn, task_id: str, run_id: int) -> None:
+    task = kb.get_task(conn, task_id)
+    if task is None or task.workflow_template_id != WORKFLOW_TEMPLATE_ID:
+        return
+    approval = _approval_for_claim(conn, task_id)
+    if approval is not None:
+        kb._append_event(
+            conn,
+            task_id,
+            "theseus_approval_consumed",
+            {"receipt_id": approval["receipt_id"], "run_id": int(run_id)},
+            run_id=int(run_id),
+        )
+        return
+    decision = _decision_for_claim(conn, task_id)
+    if decision is not None:
+        kb._append_event(
+            conn,
+            task_id,
+            "theseus_decision_consumed",
+            {"decision_id": decision["decision_id"], "run_id": int(run_id)},
+            run_id=int(run_id),
+        )
+
+
+def native_promotion_allowed_locked(conn, task_id: str) -> bool:
+    row = conn.execute(
+        "SELECT workflow_template_id, current_step_key FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    return bool(
+        row is None
+        or row["workflow_template_id"] != WORKFLOW_TEMPLATE_ID
+        or row["current_step_key"] not in {AWAITING_TERMINAL_APPROVAL, STOPPED_AWAITING_ARCHITECT}
+    )
+
+
+def prepare_native_terminal_locked(
+    conn,
+    task_id: str,
+    expected_run_id: Optional[int],
+    operation: str,
+    metadata: Optional[dict] = None,
+) -> Optional[dict]:
+    """Finalize the exact lifecycle run and CAS its phase inside caller txn."""
+    task = kb.get_task(conn, task_id)
+    if task is None or task.workflow_template_id != WORKFLOW_TEMPLATE_ID:
+        return metadata
+    if expected_run_id is None or task.current_run_id != int(expected_run_id):
+        raise ValueError("THESEUS terminal operation requires the exact active run")
+    role = (package_metadata(conn, task_id) or {}).get("role")
+    phase_by_operation = {
+        ("builder", "complete"): BUILDER_COMPLETE_AWAITING_REVIEW,
+        ("builder", "review"): BUILDER_COMPLETE_AWAITING_REVIEW,
+        ("reviewer", "changes"): CHANGES_REQUESTED,
+        ("reviewer", "complete"): GATE2_RECOMMENDATION_READY,
+        ("investigator", "complete"): CORRECTION_READY,
+    }
+    target = phase_by_operation.get((str(role), operation))
+    if target is None:
+        raise ValueError("terminal operation is not authorized for lifecycle role")
+    row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id=? AND task_id=? AND ended_at IS NULL",
+        (int(expected_run_id), task_id),
+    ).fetchone()
+    if row is None:
+        raise ValueError("exact active lifecycle run not found")
+    try:
+        run_metadata = json.loads(row["metadata"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        run_metadata = {}
+    if not isinstance(run_metadata, dict):
+        run_metadata = {}
+    paths = run_metadata.get("artifacts")
+    if not isinstance(paths, dict):
+        raise ValueError("lifecycle artifact paths are missing")
+    manifest = finalize_artifacts(
+        paths,
+        manifest_facts={"task_id": task_id, "run_id": int(expected_run_id)},
+    )
+    changed = conn.execute(
+        "UPDATE tasks SET current_step_key=? WHERE id=? AND current_step_key=? AND current_run_id=?",
+        (target, task_id, task.current_step_key, int(expected_run_id)),
+    )
+    if changed.rowcount != 1:
+        raise ValueError("lifecycle terminal phase changed concurrently")
+    merged = {**run_metadata, **(metadata or {}), "theseus_artifacts": manifest}
+    kb._append_event(
+        conn,
+        task_id,
+        "theseus_phase_transition",
+        {"previous_phase": task.current_step_key, "phase": target, "operation": operation},
+        run_id=int(expected_run_id),
+    )
+    return merged
 
 
 def stop_for_architect(
@@ -267,18 +460,54 @@ def stop_for_architect(
         "decision_questions": questions,
         "forbidden_actions": forbidden,
     }
-    if not kb.block_task(
-        conn, task_id, reason=payload["reason"], kind="needs_input", expected_run_id=int(expected_run_id)
-    ):
-        return False
-    task = kb.get_task(conn, task_id)
+    metadata = package_metadata(conn, task_id) or {}
+    if payload["baseline_sha"] != metadata.get("baseline_sha") or payload["candidate_sha"] != metadata.get("candidate_sha"):
+        raise ValueError("STOP Git identity does not match the work package")
+    stop_token = hashlib.sha256(
+        f"{task_id}\0{int(expected_run_id)}\0{payload['stop_type']}\0{payload['reason']}".encode()
+    ).hexdigest()
+    payload["stop_token"] = stop_token
     with kb.write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET current_step_key=? WHERE id=? AND status='blocked' AND worker_pid IS NULL",
-            (STOPPED_AWAITING_ARCHITECT, task_id),
+        row = conn.execute(
+            "SELECT status, current_step_key, current_run_id, worker_pid, claim_lock "
+            "FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "running" or row["current_run_id"] != int(expected_run_id):
+            return False
+        if row["current_step_key"] not in {READY_FOR_BUILDER, BUILDER_RUNNING}:
+            return False
+        run_changed = conn.execute(
+            "UPDATE task_runs SET status='blocked', outcome='blocked', summary=?, ended_at=?, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
+            "WHERE id=? AND task_id=? AND ended_at IS NULL AND claim_lock IS ? AND worker_pid IS ?",
+            (
+                payload["reason"],
+                int(time.time()),
+                int(expected_run_id),
+                task_id,
+                row["claim_lock"],
+                row["worker_pid"],
+            ),
         )
+        if run_changed.rowcount != 1:
+            return False
+        changed = conn.execute(
+            "UPDATE tasks SET status='blocked', current_step_key=?, current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, block_kind='needs_input' "
+            "WHERE id=? AND status='running' AND current_run_id=? AND claim_lock IS ? AND worker_pid IS ?",
+            (
+                STOPPED_AWAITING_ARCHITECT,
+                task_id,
+                int(expected_run_id),
+                row["claim_lock"],
+                row["worker_pid"],
+            ),
+        )
+        if changed.rowcount != 1:
+            raise ValueError("STOP task fence changed concurrently")
         kb._append_event(
-            conn, task_id, "theseus_architect_stop", payload, run_id=task.current_run_id if task else None
+            conn, task_id, "theseus_architect_stop", payload, run_id=int(expected_run_id)
         )
     return True
 
@@ -292,6 +521,7 @@ def create_role_task(
     candidate_sha: str,
     branch: str,
     worktree: str,
+    authorization_ref: Optional[str] = None,
 ) -> str:
     """Create an isolated Reviewer or Investigator task linked to Builder."""
     if role not in {"reviewer", "investigator"}:
@@ -309,7 +539,24 @@ def create_role_task(
     if branch == builder.branch_name:
         raise ValueError(f"{role} task cannot reuse the Builder branch")
     candidate_sha = _require_sha("candidate_sha", candidate_sha)
+    builder_candidate = _require_sha("builder candidate_sha", str(builder_meta.get("candidate_sha") or ""))
+    if candidate_sha != builder_candidate:
+        raise ValueError("linked role candidate must equal the Builder candidate")
+    if role == "investigator" and not str(authorization_ref or "").startswith("architect:"):
+        raise ValueError("Investigator creation requires explicit Architect authorization")
+    actual = _read_git_identity(worktree)
+    if actual["root"] != worktree or actual["branch"] != branch or actual["head"] != candidate_sha:
+        raise ValueError(f"actual Git identity does not match the {role} task")
     package_id = _require_text("package_id", builder_meta.get("package_id"))
+    collision = conn.execute(
+        "SELECT t.id FROM tasks t JOIN task_events e ON e.task_id=t.id "
+        "WHERE e.kind='theseus_lifecycle_initialized' "
+        "AND json_extract(e.payload, '$.package_id')=? AND t.id!=? AND t.status!='archived' "
+        "AND (t.workspace_path=? OR t.branch_name=?) LIMIT 1",
+        (package_id, builder_task_id, worktree, branch),
+    ).fetchone()
+    if collision is not None:
+        raise ValueError("role worktree or branch collides with another active package task")
     task_id = kb.create_task(
         conn,
         title=title,
@@ -356,9 +603,34 @@ def create_role_task(
     return task_id
 
 
+def _read_git_identity(worktree: str) -> dict[str, str]:
+    def git(*args: str) -> str:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=worktree,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return result.stdout.strip()
+
+    branch = git("branch", "--show-current")
+    if not branch:
+        raise ValueError("actual Git worktree is detached")
+    return {
+        "root": str(Path(git("rev-parse", "--show-toplevel")).resolve()),
+        "branch": branch,
+        "head": git("rev-parse", "HEAD").lower(),
+        "parent": git("rev-parse", "HEAD^").lower(),
+    }
+
+
 def resume_after_architect_decision(conn, task_id: str, *, decision_ref: str, actor: str) -> bool:
     decision_ref = kb.redact_review_value(_require_text("decision_ref", decision_ref))
     actor = kb.redact_review_value(_require_text("actor", actor))
+    if actor != "architect":
+        raise ValueError("Architect authority is required for resume")
     task = kb.get_task(conn, task_id)
     stop = _event_payload(conn, task_id, "theseus_architect_stop")
     if task is None or stop is None or task.current_step_key != STOPPED_AWAITING_ARCHITECT:
@@ -373,12 +645,22 @@ def resume_after_architect_decision(conn, task_id: str, *, decision_ref: str, ac
     metadata = package_metadata(conn, task_id) or {}
     if metadata.get("role") != "builder" or task.assignee != ROLE_PROFILES["builder"]:
         raise ValueError("Builder role/profile preflight failed")
-    if _require_worktree(str(metadata.get("worktree") or "")) != _require_worktree(task.workspace_path or ""):
+    expected_worktree = _require_worktree(str(metadata.get("worktree") or ""))
+    if expected_worktree != _require_worktree(task.workspace_path or ""):
         raise ValueError("Builder worktree preflight failed")
-    if _require_text("branch", metadata.get("branch")) != _require_text("branch", task.branch_name):
+    expected_branch = _require_text("branch", metadata.get("branch"))
+    if expected_branch != _require_text("branch", task.branch_name):
         raise ValueError("Builder branch preflight failed")
-    _require_sha("baseline_sha", str(metadata.get("baseline_sha") or ""))
-    _require_sha("candidate_sha", str(metadata.get("candidate_sha") or ""))
+    expected_baseline = _require_sha("baseline_sha", str(metadata.get("baseline_sha") or ""))
+    expected_candidate = _require_sha("candidate_sha", str(metadata.get("candidate_sha") or ""))
+    actual = _read_git_identity(expected_worktree)
+    if actual != {
+        "root": expected_worktree,
+        "branch": expected_branch,
+        "head": expected_candidate,
+        "parent": expected_baseline,
+    }:
+        raise ValueError("actual Git identity does not match the fenced work package")
     with kb.write_txn(conn):
         changed = conn.execute(
             "UPDATE tasks SET status='ready', current_step_key=?, block_kind=NULL "
@@ -387,6 +669,16 @@ def resume_after_architect_decision(conn, task_id: str, *, decision_ref: str, ac
         )
         if changed.rowcount != 1:
             raise ValueError("STOP state changed concurrently")
+        decision_id = hashlib.sha256(
+            f"{task_id}\0{stop['stop_token']}\0{decision_ref}".encode()
+        ).hexdigest()
+        replay = conn.execute(
+            "SELECT 1 FROM task_events WHERE kind='theseus_architect_decision' "
+            "AND json_extract(payload, '$.decision_id')=? LIMIT 1",
+            (decision_id,),
+        ).fetchone()
+        if replay is not None:
+            raise ValueError("Architect decision receipt was already used")
         kb._append_event(
             conn,
             task_id,
@@ -394,6 +686,8 @@ def resume_after_architect_decision(conn, task_id: str, *, decision_ref: str, ac
             {
                 "actor": actor,
                 "decision_ref": decision_ref,
+                "decision_id": decision_id,
+                "stop_token": stop["stop_token"],
                 "resolves_stop_run_id": stop["stopped_run_id"],
                 "phase": READY_FOR_BUILDER,
             },
@@ -414,6 +708,18 @@ def dispatch_preflight(conn, task_id: str) -> tuple[bool, Optional[str]]:
     role = metadata.get("role")
     if task.assignee != ROLE_PROFILES.get(str(role)):
         return False, "role_profile_mismatch"
+    if role in {"reviewer", "investigator"}:
+        if metadata.get("authority") != "read-only" or metadata.get("publish_allowed") is not False or metadata.get("merge_allowed") is not False:
+            return False, "role_authority_policy_mismatch"
+        active_peer = conn.execute(
+            "SELECT 1 FROM tasks t JOIN task_events e ON e.task_id=t.id "
+            "WHERE e.kind='theseus_lifecycle_initialized' AND t.id!=? AND t.status='running' "
+            "AND json_extract(e.payload, '$.package_id')=? "
+            "AND json_extract(e.payload, '$.role') IN ('reviewer','investigator') LIMIT 1",
+            (task_id, metadata.get("package_id")),
+        ).fetchone()
+        if active_peer is not None:
+            return False, "role_concurrency_blocked"
     dispatchable_phases = set(ROLE_READY_PHASE.values())
     if role == "builder":
         # Crash recovery ends the prior task_run and returns the same stable
@@ -425,8 +731,7 @@ def dispatch_preflight(conn, task_id: str) -> tuple[bool, Optional[str]]:
     if task.worker_pid is not None:
         return False, "worker_pid_present"
     if role == "builder" and not (
-        _event_payload(conn, task_id, "theseus_terminal_approved")
-        or _event_payload(conn, task_id, "theseus_architect_decision")
+        _approval_for_claim(conn, task_id) or _decision_for_claim(conn, task_id)
     ):
         return False, "approval_missing"
     return True, None
@@ -440,11 +745,20 @@ def enforce_dispatch_preflight(conn, task_id: str) -> tuple[bool, Optional[str]]
         return ok, reason
     if task.status == "ready":
         with kb.write_txn(conn):
+            next_phase = (
+                AWAITING_TERMINAL_APPROVAL
+                if reason == "approval_missing" and (package_metadata(conn, task_id) or {}).get("role") == "builder"
+                else task.current_step_key
+            )
             changed = conn.execute(
-                "UPDATE tasks SET status='blocked', claim_lock=NULL, claim_expires=NULL, "
+                "UPDATE tasks SET status='blocked', current_step_key=?, claim_lock=NULL, claim_expires=NULL, "
                 "worker_pid=NULL, block_kind=? "
                 "WHERE id=? AND status='ready' AND current_run_id IS NULL",
-                ("approval" if task.current_step_key == AWAITING_TERMINAL_APPROVAL else "needs_input", task_id),
+                (
+                    next_phase,
+                    "approval" if reason == "approval_missing" or task.current_step_key == AWAITING_TERMINAL_APPROVAL else "needs_input",
+                    task_id,
+                ),
             )
             if changed.rowcount == 1:
                 kb._append_event(
@@ -512,6 +826,14 @@ def readback(conn, task_id: str) -> dict:
         "run_count": len(runs),
         "latest_stop": _event_payload(conn, task_id, "theseus_architect_stop"),
         "latest_decision": _event_payload(conn, task_id, "theseus_architect_decision"),
+        "dispatch_diagnostic": dispatch_diagnostic(
+            conn,
+            task_id,
+            dispatcher_enabled=True,
+            lock_contended=False,
+            profile_available=True,
+            capacity_available=True,
+        ),
     }
 
 
@@ -549,19 +871,87 @@ def dispatch_diagnostic(
     return {"task_id": task_id, "reason": reason, "status": task.status if task else None}
 
 
-def run_artifact_paths(root: Path, board: str, task_id: str, run_id: int) -> dict[str, str]:
-    directory = Path(root).expanduser().resolve() / board / task_id / str(int(run_id))
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(directory, 0o700)
-    report = directory / "report.md"
-    result = directory / "result.md"
-    if report.resolve() == result.resolve() or (report.exists() and result.exists() and os.path.samefile(report, result)):
-        raise ValueError("report and result artifact paths collide")
+_ARTIFACT_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _artifact_component(name: str, value: Any) -> str:
+    value = str(value)
+    if value in {".", ".."} or not _ARTIFACT_COMPONENT_RE.fullmatch(value):
+        raise ValueError(f"invalid artifact path component: {name}")
+    return value
+
+
+def _open_secure_directory(path: Path) -> int:
+    """Open/create an absolute directory chain without following symlinks."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path.anchor, flags)
+    try:
+        for component in path.parts[1:]:
+            created = False
+            try:
+                os.mkdir(component, 0o700, dir_fd=fd)
+                created = True
+            except FileExistsError:
+                pass
+            next_fd = os.open(component, flags, dir_fd=fd)
+            if created:
+                os.fchmod(next_fd, 0o700)
+            os.close(fd)
+            fd = next_fd
+        os.fchmod(fd, 0o700)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def run_artifact_paths(root: Path, board: str, task_id: str, run_id: int) -> dict[str, Any]:
+    components = (
+        _artifact_component("board", board),
+        _artifact_component("task_id", task_id),
+        _artifact_component("run_id", str(int(run_id))),
+    )
+    root_path = Path(os.path.abspath(os.fspath(Path(root).expanduser())))
+    try:
+        fd = _open_secure_directory(root_path)
+    except OSError as exc:
+        raise ValueError("artifact root contains a symlink or unsafe component") from exc
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        current = root_path
+        for component in components:
+            try:
+                os.mkdir(component, 0o700, dir_fd=fd)
+            except FileExistsError:
+                pass
+            next_fd = os.open(component, flags, dir_fd=fd)
+            os.fchmod(next_fd, 0o700)
+            os.close(fd)
+            fd = next_fd
+            current /= component
+        identities: dict[str, list[int]] = {}
+        create_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        for name in ("report", "result"):
+            filename = f"{name}.md"
+            try:
+                artifact_fd = os.open(filename, create_flags, 0o600, dir_fd=fd)
+            except FileExistsError as exc:
+                raise ValueError(f"artifact {name} already exists") from exc
+            try:
+                st = os.fstat(artifact_fd)
+                identities[name] = [int(st.st_dev), int(st.st_ino)]
+            finally:
+                os.close(artifact_fd)
+    except OSError as exc:
+        raise ValueError("artifact path contains a symlink or unsafe component") from exc
+    finally:
+        os.close(fd)
     return {
-        "directory": str(directory),
-        "report": str(report),
-        "result": str(result),
-        "manifest": str(directory / "manifest.json"),
+        "directory": str(current),
+        "report": str(current / "report.md"),
+        "result": str(current / "result.md"),
+        "manifest": str(current / "manifest.json"),
+        "_identity": identities,
     }
 
 
@@ -588,25 +978,68 @@ def persist_run_artifact_paths(conn, task_id: str, run_id: int, *, board: str, r
     return paths
 
 
-def finalize_artifacts(paths: dict[str, str], *, manifest_facts: Optional[dict] = None) -> dict:
-    report = Path(paths["report"]).resolve()
-    result = Path(paths["result"]).resolve()
-    if report == result or (report.exists() and result.exists() and os.path.samefile(report, result)):
-        raise ValueError("report and result artifact paths collide")
+def finalize_artifacts(paths: dict[str, Any], *, manifest_facts: Optional[dict] = None) -> dict:
+    directory = Path(paths["directory"])
+    if directory.is_symlink():
+        raise ValueError("artifact directory is a symlink")
+    identities = paths.get("_identity")
+    if not isinstance(identities, dict):
+        raise ValueError("prepared artifact identity is missing")
+    directory_fd = os.open(
+        directory,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+    )
     files: dict[str, dict] = {}
-    for name, path in (("report", report), ("result", result)):
-        if not path.is_file():
-            files[name] = {"path": str(path), "status": "NOT PRODUCED"}
-            continue
-        data = path.read_bytes()
-        files[name] = {
-            "path": str(path),
-            "status": "PRESENT",
-            "size": len(data),
-            "sha256": hashlib.sha256(data).hexdigest(),
-        }
-    manifest = {"artifacts": files, **(manifest_facts or {})}
-    manifest_path = Path(paths["manifest"])
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.chmod(manifest_path, stat.S_IRUSR | stat.S_IWUSR)
+    try:
+        seen: set[tuple[int, int]] = set()
+        for name in ("report", "result"):
+            expected = identities.get(name)
+            if not isinstance(expected, list) or len(expected) != 2:
+                raise ValueError(f"prepared {name} identity is missing")
+            try:
+                fd = os.open(
+                    f"{name}.md",
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_fd,
+                )
+            except OSError as exc:
+                raise ValueError(f"artifact {name} was replaced or is a symlink") from exc
+            try:
+                st = os.fstat(fd)
+                identity = (int(st.st_dev), int(st.st_ino))
+                if identity != tuple(expected) or identity in seen or not stat.S_ISREG(st.st_mode):
+                    raise ValueError(f"artifact {name} was replaced or paths collide")
+                seen.add(identity)
+                chunks = []
+                while True:
+                    chunk = os.read(fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                data = b"".join(chunks)
+            finally:
+                os.close(fd)
+            files[name] = {
+                "path": str(directory / f"{name}.md"),
+                "status": "PRESENT",
+                "size": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+        manifest = {"artifacts": files, **(manifest_facts or {})}
+        manifest_fd = os.open(
+            "manifest.json",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        try:
+            payload = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
+            os.write(manifest_fd, payload)
+            os.fsync(manifest_fd)
+        finally:
+            os.close(manifest_fd)
+    except OSError as exc:
+        raise ValueError("artifact manifest path is unsafe or already finalized") from exc
+    finally:
+        os.close(directory_fd)
     return manifest
