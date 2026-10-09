@@ -524,3 +524,82 @@ Production authenticated identity, Architect-approved issuer, principal/role aut
 Builderin tekninen validointi ei ole oma katselmus, Gate 2 -hyväksyntä, sprintin sulkeminen tai production activation readiness -väite.
 
 R6 TECHNICALLY VALIDATED — PRODUCTION AUTHORITY/DEPLOYMENT BLOCKED — AWAITING INDEPENDENT REVIEWER R6
+
+---
+
+# R6 B-01 final defect correction — validation results — 2026-10-09
+
+Tila: `AWAITING INDEPENDENT POST-CORRECTION REVIEW`
+
+Session: `@session:theseus-builder/20261009_065333_78258d`
+
+Testattu puhdas code SHA: `3141468d0bd7fa720b3cb454d41d151414a7a729`
+
+Code parent / published correction authorization lock: `44c700438e543b93bba8b56b8e09ed2b3878ff34`
+
+Fork code readback: `3141468d0bd7fa720b3cb454d41d151414a7a729` — MATCH
+
+## B-01 / D-01 validation matrix
+
+| Kohta | Builder-tulos | Evidenssi |
+|---|---|---|
+| B-01 before expiry | PASS | `now=149` säilyttää approvalin claim-kelpoisena; preflight sallii. |
+| B-01 exact expiry | PASS | `now=150`: preflight/dispatch hylkää ilman DB/event-muutosta; native claim palauttaa `None`; koko `iterdump` ja event-lista säilyvät identtisinä. |
+| B-01 after expiry | PASS | `now=151`: preflight hylkää `approval_expired`; native claim palauttaa `None`; koko `iterdump` ja event-lista säilyvät identtisinä. |
+| B-01 muut rejection-syyt | PASS preserved | Non-approved lifecycle native claim kirjoittaa edelleen `claim_rejected`-eventin payloadilla `{"reason": "theseus_lifecycle_gate"}`; affected suite säilyttää muut generic claim -hylkäykset. |
+| D-01 | PASS dokumenttitarkistus | Stale shipping `_authority_gate_locked` -kuvaus korvattiin nykyisellä production fail-closed + test-tree harness -rajalla. Production authority pysyy blokattuna. |
+| R3/R4/R6 protections | PASS preserved | Restricted role, designated host/profile, artifact fencing/publication, pidfd/manual retry fence, dry-run non-mutation sekä R6 authority containment/role creation -testit läpäisivät. |
+
+Builderin PASS ei ole riippumaton katselmus eikä Gate 2 -päätös.
+
+## Strict TDD receipt
+
+1. RED ennen production-muutosta:
+   - Komento: `HERMES_TEST_FILE_RETRIES=0 HERMES_PYTHON=/opt/data/cache/glh-r1-20261009-venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_kanban_theseus_lifecycle.py -k expired_native_claim_is_byte_for_byte_non_mutating -q --tb=short -p no:cacheprovider`.
+   - Exit `1`; `2 failed, 63 deselected`.
+   - Exact ja after epäonnistuivat odotetusti, koska `claim_rejected` muutti koko DB dumpin.
+2. GREEN production-korjauksen jälkeen:
+   - Komento: `HERMES_TEST_FILE_RETRIES=0 HERMES_PYTHON=/opt/data/cache/glh-r1-20261009-venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_kanban_theseus_lifecycle.py -k 'expired_native_claim_is_byte_for_byte_non_mutating or stored_approval_expiry_is_exclusive_at_claim_boundary or exact_expiry_dispatch_creates_no_run_claim_or_state_transition' -q --tb=short -p no:cacheprovider`.
+   - Exit `0`; `6 passed, 0 failed`.
+3. Lopullinen focused B-01 + rejection-regressio:
+   - Komento: `HERMES_TEST_FILE_RETRIES=0 HERMES_PYTHON=/opt/data/cache/glh-r1-20261009-venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_kanban_theseus_lifecycle.py -k 'stored_approval_expiry or expiry_dispatch or expired_native_claim or native_claim_unblock' -q --tb=short -p no:cacheprovider`.
+   - Exit `0`; `7 passed, 0 failed`.
+
+## Exact clean code SHA -validointi
+
+1. Relevant lifecycle + authority:
+   - Komento: `HERMES_TEST_FILE_RETRIES=0 HERMES_PYTHON=/opt/data/cache/glh-r1-20261009-venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_kanban_authority_verifier.py tests/hermes_cli/test_kanban_theseus_lifecycle.py -q --tb=short -p no:cacheprovider`.
+   - Exit `0`; 2 tiedostoa; `91 passed, 0 failed`.
+2. Retained R3/R4/R6 selector:
+   - Komento: `HERMES_TEST_FILE_RETRIES=0 HERMES_PYTHON=/opt/data/cache/glh-r1-20261009-venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_kanban_theseus_lifecycle.py -k 'role_native_claim or role_worker_capabilities or all_dispatch_and_native_claim or artifact or pid_bind or spawn_cleanup or lifecycle_dry_run or stored_approval_expiry or expiry_dispatch or expired_native_claim' -q --tb=short -p no:cacheprovider`.
+   - Exit `0`; `23 passed, 0 failed`.
+3. Affected Kanban/Gateway:
+   - Komento: `HERMES_TEST_FILE_RETRIES=0 HERMES_PYTHON=/opt/data/cache/glh-r1-20261009-venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_kanban*.py tests/gateway/test_kanban*.py tests/plugins/test_kanban*.py tests/tools/test_kanban*.py tests/agent/test_kanban*.py tests/tui_gateway/test_kanban*.py -q --tb=short -p no:cacheprovider`.
+   - Exit `0`; 84 tiedostoa; `641 passed, 0 failed, 3 skipped`; runner wall 38.9 s.
+   - Kolme testiä ovat Windows-only `SKIPPED`, eivät PASS.
+   - `tests/gateway/test_kanban_wake_acceptance.py`: nykyajossa `3 passed` ensimmäisellä yrityksellä; historiallinen timeout säilyy silti `FLAKY`.
+4. Isolated synthetic pilot:
+   - Komento: `HERMES_TEST_FILE_RETRIES=0 HERMES_PYTHON=/opt/data/cache/glh-r1-20261009-venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_kanban_theseus_lifecycle.py -k isolated_pilot_uses_synthetic_subprocess_and_run_readback -q --tb=short -p no:cacheprovider`.
+   - Exit `0`; `1 passed`.
+5. Ruff:
+   - Komento: `/opt/data/cache/glh-r1-20261009-venv/bin/ruff check hermes_cli/kanban_db.py tests/hermes_cli/test_kanban_theseus_lifecycle.py`.
+   - Exit `0`; `All checks passed!`.
+6. Code-range diff:
+   - Komento: `git diff --check 44c700438e543b93bba8b56b8e09ed2b3878ff34..3141468d0bd7fa720b3cb454d41d151414a7a729`.
+   - Exit `0`.
+7. Scanner availability:
+   - Komennot: `command -v gitleaks`, `command -v trufflehog`, `command -v detect-secrets`, `command -v semgrep`.
+   - Jokainen exit `1`: `NOT AVAILABLE`; puuttumista ei merkitä PASSiksi.
+
+## Säilytetyt statukset, blockerit ja scope
+
+- Windows runtime: `NOT RUN` Linux-hostilla.
+- Kolme Windows-only-testiä: `SKIPPED`.
+- Historiallinen wake first-attempt 300 s timeout: `FLAKY`.
+- Live Gateway, production board, deployment ja live rollback: `NOT RUN`.
+- Production authority: `BLOCKED — PRODUCTION AUTHORITY NOT AVAILABLE`; production authority/trust/revocation/receipt infrastructure `NOT AVAILABLE / NOT USED`.
+- Ei uutta auditointimallia, skeemaa, migraatiota tai taulua.
+- Ei S123/S124-muutosta, upstream-mergeä, rebasea, force-pushia, R7-aloitusta tai Reviewer-dispatchia.
+- Ei Gate 2-, Architect approval-, completion- tai production readiness -väitettä.
+
+AWAITING INDEPENDENT POST-CORRECTION REVIEW

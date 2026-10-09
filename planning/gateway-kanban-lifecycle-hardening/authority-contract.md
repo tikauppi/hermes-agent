@@ -6,9 +6,11 @@ Tämä sopimus erottaa toteutetun turvarajan, testipuuhun rajatulla synteettisel
 
 ## 1. IMPLEMENTED
 
-### Yhteinen pakollinen mutaatioraja
+### Nykyinen toimitettava mutaatioraja
 
-Terminal approval, fresh approval, Architect resume ja Investigator-luontiin liittyvä Architect-päätös kulkevat saman `_authority_gate_locked`-rajan kautta varsinaisessa SQLite-write-transaktiossa. CLI ja Gatewayn `/kanban` käyttävät samaa `run_slash`- ja lifecycle-polkuja. Pythonin suora lifecycle-kutsu ei saa erillistä poikkeusta. Yleinen `_transition` ei saa siirtää approval- tai Architect-päätöstä vaativaa vaihetta `READY_FOR_BUILDER`-tilaan.
+Toimitettavat production-entrypointit terminal approvalille, fresh approvalille, Architect resumelle sekä Reviewer/Investigator-roolitaskin luonnille pysähtyvät ennen ensimmäistä tietokantakirjoitusta tilaan `BLOCKED — TRUSTED AUTHORITY NOT CONFIGURED`. CLI ja Gatewayn `/kanban` käyttävät samaa `run_slash`- ja lifecycle-polkuja, eikä Pythonin suora lifecycle-kutsu saa erillistä poikkeusta. Yleinen `_transition` ei saa siirtää approval- tai Architect-päätöstä vaativaa vaihetta `READY_FOR_BUILDER`-tilaan.
+
+Allekirjoitetun evidenssin varmennus, atominen kulutus, tilasiirtymä ja auditointi harjoitetaan nykyisin vain testipuun `tests/hermes_cli/kanban_lifecycle_authority_harness.py`-rajassa. Poistettua shipping-symbolia `_authority_gate_locked` ei ole. Testiharness kutsuu lifecycle-moduulin sisäisiä transaktiomutaatioita samalla SQLite-write-transaktiolla, mutta sitä ei paketoida production API:ksi eikä normaali API-, CLI- tai Gateway-kutsuja voi toimittaa sille synteettistä issuer-, avain-, trust- tai principal-materiaalia.
 
 Caller-supplied `actor`, `approval_ref`, `approved_at`, `decision_ref`, muu metadata, ympäristömuuttuja, profiili tai `ContextVar` ei muodosta auktoriteettia. Niillä ei voi korjata allekirjoituksen, issuer-valtuutuksen tai sidonnan virhettä.
 
@@ -44,7 +46,7 @@ Toteutus käyttää nykyisiä `task_events`- ja task-rakenteita. Se ei lisää s
 |---|---|---|
 | R6-01 Synthetic authority containment | IMPLEMENTED / VALIDATED | `SyntheticAuthorityTestConfiguration` sekä `_record_terminal_approval_for_test`, `_issue_fresh_terminal_approval_for_test`, `_create_role_task_for_test` ja `_resume_after_architect_decision_for_test` poistettiin toimitettavasta `hermes_cli`-moduulista. Disposable key-, issuer-, trust-root- ja principal-rakennus on vain `tests/hermes_cli/kanban_lifecycle_authority_harness.py`:ssä. Normaali production lifecycle -kutsuja ei voi toimittaa synteettistä verifieria tai caller-controlled trust materiaalia mutaatiopolulle. |
 | R6-02 Role creation authorization | IMPLEMENTED / VALIDATED | Julkinen `create_role_task` hylkää sekä `reviewer`- että `investigator`-luonnin ennen ensimmäistä tietokantakirjoitusta. Sisäinen auktorisoitu testipolku suorittaa taskin, linkin, metadatan ja eventin yhdessä transaktiossa; pakotettu event/audit-virhe rollbackaa kaiken. CLI ja Gateway käyttävät samoja lifecycle-polkuja eivätkä saa vaihtoehtoista roolinluontiohitusta. |
-| R6-03 Stored approval expiry | IMPLEMENTED / VALIDATED | Tallennettu approval validoidaan uudelleen claim/preflight-kulutusrajalla. `now >= approval_expires_at` on vanhentunut. Ennen rajaa approval voidaan kuluttaa; täsmälleen rajalla ja rajan jälkeen ei synny runia, claim-eventtiä eikä pysyvää tilasiirtymää. |
+| R6-03 Stored approval expiry / B-01 | CORRECTED / BUILDER VALIDATED — AWAITING INDEPENDENT POST-CORRECTION REVIEW | Tallennettu approval validoidaan uudelleen claim/preflight-kulutusrajalla. `now >= approval_expires_at` on vanhentunut. Ennen rajaa approval voidaan kuluttaa; täsmälleen rajalla ja rajan jälkeen dispatch/preflight sekä native claim eivät synnytä runia, claim-eventtiä, task-siirtymää tai muuta pysyvää Kanban-muutosta. Builderin validointi ei korvaa riippumatonta katselmusta. |
 
 ### Todellinen trust boundary
 

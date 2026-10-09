@@ -319,3 +319,54 @@ Synthetic pilot käytti disposable SQLite-kantaa, temporary worktree -polkuja ja
 - Ei Reviewer R6 -dispatchia, R7-aloitusta, Gate 2 -hyväksyntää, sprintin sulkemista tai production activation readiness -väitettä.
 
 R6 TECHNICALLY VALIDATED — PRODUCTION AUTHORITY/DEPLOYMENT BLOCKED — AWAITING INDEPENDENT REVIEWER R6
+
+---
+
+# R6 B-01 final defect correction — implementation results — 2026-10-09
+
+Tila: `AWAITING INDEPENDENT POST-CORRECTION REVIEW`
+
+Session: `@session:theseus-builder/20261009_065333_78258d`
+
+- Published correction authorization lock / code parent: `44c700438e543b93bba8b56b8e09ed2b3878ff34`.
+- R6 code: `55fe9171cee560a632ca1948c9f7593200a15c60`.
+- R6 evidence baseline: `8cd1f198aebf2348cbe8a2672eaa9c93a96d78d9`.
+- B-01 code/test SHA: `3141468d0bd7fa720b3cb454d41d151414a7a729`.
+- Code parent relationship: `3141468d0bd7fa720b3cb454d41d151414a7a729^ = 44c700438e543b93bba8b56b8e09ed2b3878ff34` — MATCH.
+- Branch: `fix/theseus-gateway-kanban-lifecycle-r6-b01`.
+- Fork code readback: `3141468d0bd7fa720b3cb454d41d151414a7a729` — MATCH.
+- Evidence/docs SHA: tämän osion, päivitetyn authority contractin ja validation-osion sisältävän seuraavan commitin SHA; exact local/live arvo varmennetaan pushin jälkeen.
+
+## B-01 / D-01 correction matrix
+
+| Kohta | Tila | Toteutus |
+|---|---|---|
+| B-01 expired native claim | CORRECTED / BUILDER VALIDATED | `claim_task` säilyttää muiden lifecycle-hylkäysten `claim_rejected`-auditin, mutta ei kirjoita sitä, kun hylkäyksen täsmällinen syy on vanhentunut tallennettu approval. Exact- ja after-boundary native claim vertaavat koko SQLite `iterdump`-snapshotia ja event-listaa ennen/jälkeen. Ennen expiryä approval säilyy käytettävänä. Dispatch/preflight exact/after hylkää ilman runia tai pysyvää muutosta. |
+| D-01 stale authority terminology | CORRECTED | `authority-contract.md` ei kuvaa poistettua shipping `_authority_gate_locked`-symbolia nykyisenä boundaryna. Dokumentti erottaa shipping production-entrypointtien fail-closed-rajan testipuun synteettisestä same-transaction-harnessista ja säilyttää production authorityn blokattuna. |
+
+## Rajattu koodimuutos
+
+Koodicommit muutti täsmälleen:
+
+1. `hermes_cli/kanban_db.py`;
+2. `tests/hermes_cli/test_kanban_theseus_lifecycle.py`.
+
+Ei uutta auditointimallia, skeemaa, migraatiota tai taulua. Muiden kuin expired-approval-hylkäysten nykyinen event-käyttäytyminen säilyy; olemassa oleva non-approved lifecycle gate tuottaa edelleen `claim_rejected`-eventin syyllä `theseus_lifecycle_gate`.
+
+## Strict TDD RED → GREEN
+
+- RED-testiksi muutettiin yksi behavior-level-testi `test_expired_native_claim_is_byte_for_byte_non_mutating`, parametreina exact `150` ja after `151` approval-expiryyn `150`.
+- RED-komento: `HERMES_TEST_FILE_RETRIES=0 HERMES_PYTHON=/opt/data/cache/glh-r1-20261009-venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_kanban_theseus_lifecycle.py -k expired_native_claim_is_byte_for_byte_non_mutating -q --tb=short -p no:cacheprovider`.
+- RED: exit `1`; `2 failed`; molemmissa diffissä ainoa uusi pysyvä rivi oli `claim_rejected` syyllä `theseus_lifecycle_gate`.
+- Pienin production-korjaus lisättiin vasta REDin jälkeen `claim_task`-haaraan.
+- GREEN focused expiry/rejection: exit `0`; `7 passed, 0 failed`.
+
+## Rajat ja blockerit
+
+- Production authority: `BLOCKED — PRODUCTION AUTHORITY NOT AVAILABLE`; production-entrypointit palauttavat `BLOCKED — TRUSTED AUTHORITY NOT CONFIGURED`.
+- Windows runtime: `NOT RUN` Linux-hostilla; kolme Windows-only-testiä `SKIPPED`.
+- Historiallinen wake-acceptance first-attempt 300 s timeout säilyy `FLAKY`, vaikka tämän korjauksen affected suite läpäisi tiedoston ensimmäisellä yrityksellä (`3 passed`).
+- Live Gateway, production board, production deployment ja live rollback: `NOT RUN`.
+- Ei S123/S124-muutoksia, upstream-mergeä, rebasea, force-pushia, R7-aloitusta, Reviewer-dispatchia, Gate 2 -päätöstä, Architect-hyväksyntää, sprintin sulkemista eikä production readiness -väitettä.
+
+AWAITING INDEPENDENT POST-CORRECTION REVIEW
