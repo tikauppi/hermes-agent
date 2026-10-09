@@ -434,3 +434,93 @@ Scannerien puuttumista ei merkitä PASSiksi.
 Builderin tekninen validointi ei ole oma katselmus eikä Arkkitehdin hyväksyntä.
 
 R5 TECHNICALLY VALIDATED — PRODUCTION AUTHORITY BLOCKED — AWAITING INDEPENDENT REVIEWER R5
+
+---
+
+# R6 corrective validation — 2026-10-09
+
+Tila: `R6 TECHNICALLY VALIDATED — PRODUCTION AUTHORITY/DEPLOYMENT BLOCKED — AWAITING INDEPENDENT REVIEWER R6`
+
+Session: `@session:theseus-builder/20261009_061621_1e0e6e`
+
+- Authorization lock / parent: `8e6aacc2c591da7d36a6700472129fc35b392eed`.
+- Tested R6 code SHA: `55fe9171cee560a632ca1948c9f7593200a15c60`.
+- Fork code readback: `55fe9171cee560a632ca1948c9f7593200a15c60` — MATCH.
+- Evidence/docs SHA: tämän kolmen tiedoston evidence-commitin SHA; exact local/live arvo varmennetaan pushin jälkeen.
+
+## R6-validointimatriisi
+
+| Kohta | Tila | Exact code SHA -evidenssi |
+|---|---|---|
+| R6-01 | PASS scoped containment | Shipping-moduulissa ei ole `SyntheticAuthorityTestConfiguration`-luokkaa, `_for_test`-mutaatiowrappereita tai caller-injektoitavaa test authority -parametria. Testiharness sijaitsee testipuussa. Production lifecycle, direct Python, CLI ja Gateway bypass -tapaukset fail-closed. Tämä ei ole väite saman prosessin arbitrary Python -eristyksestä. |
+| R6-02 | PASS | Reviewer/Investigator direct/native, CLI ja Gateway-reitit harjoitettiin. Julkinen creation hylättiin ennen DB-writea; no-write snapshot säilyi. Sisäisen hyväksytyn polun forced event/audit failure rollbackasi taskin, linkin, metadatan ja eventin. Concurrent/replay/idempotency-rajat säilyivät. |
+| R6-03 | PASS | Stored approval testattiin ennen expiry-rajaa, exact boundarylla ja sen jälkeen. `now >= approval_expires_at` hylättiin ennen runia, claim-eventtiä tai persistent transitionia sekä dispatch/preflight- että native claim -kulutuksessa. |
+| R4-02 / R3-04 | PASS / preserved | Restricted-role dispatcher/native claim, designated profile/host, read-only capability ja active-peer -rajat säilyivät. |
+| R4-03 | PASS Linux/POSIX / preserved | Artifact identity, symlink/hardlink/replacement, fsync/no-replace, cleanup ja unsupported-platform fail-closed -regressiot säilyivät. Windows runtime `NOT RUN`. |
+| R4-05 | PASS Linux / preserved | pidfd birth identity, manual retry fence, bind failure/exception ja retry prevention säilyivät. |
+| R3-06 | PASS / preserved | Dry-run DB/artifact non-mutation säilyi. |
+
+## Exact clean code SHA -komennot, exitit ja tulokset
+
+Kaikki alla olevat testitulokset ajettiin puhtaasta `55fe9171cee560a632ca1948c9f7593200a15c60`-checkoutista canonical `scripts/run_tests.sh` -runnerilla ja `HERMES_TEST_FILE_RETRIES=0`:lla.
+
+1. Focused authority/lifecycle:
+   - Komento: `HERMES_TEST_FILE_RETRIES=0 HERMES_PYTHON=/opt/data/cache/glh-r1-20261009-venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_kanban_authority_verifier.py tests/hermes_cli/test_kanban_theseus_lifecycle.py -q --tb=short -p no:cacheprovider`
+   - Exit `0`; `90 passed, 0 failed`.
+2. Affected Kanban/Gateway:
+   - Komento: `HERMES_TEST_FILE_RETRIES=0 HERMES_PYTHON=/opt/data/cache/glh-r1-20261009-venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_kanban*.py tests/gateway/test_kanban*.py tests/plugins/test_kanban*.py tests/tools/test_kanban*.py tests/agent/test_kanban*.py tests/tui_gateway/test_kanban*.py -q --tb=short -p no:cacheprovider`
+   - Exit `0`; 84 tiedostoa; `640 passed, 0 failed, 3 skipped`.
+   - Kolme skip-tapausta ovat Windows-only: `SKIPPED`, eivät PASS.
+3. Retained R4/R3 invariants:
+   - Komento: `HERMES_TEST_FILE_RETRIES=0 HERMES_PYTHON=/opt/data/cache/glh-r1-20261009-venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_kanban_theseus_lifecycle.py -k 'role_native_claim or role_worker_capabilities or all_dispatch_and_native_claim or artifact or pid_bind or spawn_cleanup or lifecycle_dry_run' -q --tb=short -p no:cacheprovider`
+   - Exit `0`; `17 passed, 0 failed`.
+4. Isolated synthetic pilot:
+   - Komento: `HERMES_TEST_FILE_RETRIES=0 HERMES_PYTHON=/opt/data/cache/glh-r1-20261009-venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_kanban_theseus_lifecycle.py -k isolated_pilot_uses_synthetic_subprocess_and_run_readback -q --tb=short -p no:cacheprovider`
+   - Exit `0`; `1 passed`.
+5. Ruff:
+   - Komento: `/opt/data/cache/glh-r1-20261009-venv/bin/python -m ruff check --no-cache hermes_cli/kanban_theseus_lifecycle.py tests/hermes_cli/kanban_lifecycle_authority_harness.py tests/hermes_cli/test_kanban_theseus_lifecycle.py`
+   - Exit `0`; `All checks passed!`.
+6. Diff:
+   - Komento: `git diff --check 8e6aacc2c591da7d36a6700472129fc35b392eed..55fe9171cee560a632ca1948c9f7593200a15c60`
+   - Exit `0`.
+7. Secret scanner availability:
+   - Komento: `command -v gitleaks; command -v trufflehog; command -v detect-secrets; command -v semgrep`.
+   - Exit `1`; kaikki neljä `NOT AVAILABLE`; poissaoloa ei merkitä PASSiksi.
+   - Rajattu fallback-riskikuviohaku muuttuneista Python-tiedostoista: 0 osumaa.
+
+## Synthetic pilot ja trust boundary
+
+Pilot käytti disposable SQLite-kantaa, temporary worktree -polkuja, testipuussa generoitua disposable Ed25519-avainta ja synteettistä aliprosessia. PID/run/terminal-state luettiin takaisin. Live Gatewayta, production boardia, production issueria, signing keytä tai trust storea ei käytetty.
+
+Testihakemisto ja import containment eivät eristä mielivaltaista Pythonia, jolla on samat prosessi- tai DB-oikeudet. Todellinen raja on trusted process + database rights. R6:n PASS koskee normaalin toimitettavan lifecycle/API/CLI/Gateway-pinnan synteettisen authority capabilityn poistamista ja testatun mutaatiopolun fail-closed-käyttäytymistä.
+
+## FLAKY, platformit ja NOT RUN
+
+- Historiallinen `tests/gateway/test_kanban_wake_acceptance.py` first-attempt 300 s timeout säilyy `FLAKY`; current R6 exact-SHA affected suite läpäisi.
+- Windows runtime: `NOT RUN` Linux-hostilla.
+- Windows-only: 3 `SKIPPED`, eivät PASS.
+- Live Gateway, production board, live deployment ja live rollback: `NOT RUN`.
+
+## Scannerit ja avoimet riskit
+
+- `gitleaks`: `NOT AVAILABLE`.
+- `trufflehog`: `NOT AVAILABLE`.
+- `detect-secrets`: `NOT AVAILABLE`.
+- `semgrep`: `NOT AVAILABLE`.
+- Scannerien puuttumista ei merkitä PASSiksi.
+- Arbitrary same-process Python ja suora SQLite-write-oikeus ovat edelleen trust boundaryn sisällä; prosessi-/DB-sandboxia ei lisätty.
+
+## Production authority- ja deployment-blockerit
+
+Production authenticated identity, Architect-approved issuer, principal/role authorization, signing-key management, trusted public-key distribution/trust store, authoritative revocation/receipt store, cross-board replay policy, monitoring, retention, incident response, canary ja rollout-päätös puuttuvat. Production approval/decision/resume säilyy fail-closed-tilassa `BLOCKED — TRUSTED AUTHORITY NOT CONFIGURED`. Nämä ovat erillisiä operational/deployment-riippuvuuksia, eivät R6-scopeen piilotettuja toteutuspuutteita.
+
+## Publication- ja scope-attestointi
+
+- R6 code commit muuttaa vain kolmea koodi/testipolkua ja on julkaistu forkille normaalisti ilman forcea.
+- Tämä erillinen evidence/docs-commit muuttaa vain `authority-contract.md`, `implementation-results.md` ja `validation-results.md`.
+- Ei source/test-lisäcommittia, S123/S124-, schema/table/migration-, domain/API/UI/public-contract-, desired-state-, profile-, production-board- tai production-authority-muutosta.
+- Ei mergeä, rebasea, force-pushia, origin-pushia, live-aktivointia, Reviewer R6 -dispatchia, R7-aloitusta tai Gate 2 -päätöstä.
+
+Builderin tekninen validointi ei ole oma katselmus, Gate 2 -hyväksyntä, sprintin sulkeminen tai production activation readiness -väite.
+
+R6 TECHNICALLY VALIDATED — PRODUCTION AUTHORITY/DEPLOYMENT BLOCKED — AWAITING INDEPENDENT REVIEWER R6

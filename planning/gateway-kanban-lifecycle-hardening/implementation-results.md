@@ -246,3 +246,76 @@ Jos cross-board atomic consumption vaatii uuden globaalin mallin, skeeman tai ta
 Koodicommit muuttaa täsmälleen seitsemän polkua: neljä lifecycle/verifier/CLI Python-polkuja, authority contractin sekä kaksi testiä. Ei S123/S124-, schema/table/migration-, production issuer/key/trust-store-, desired-state-, profile-, live Gateway- tai production board -muutosta. Ei mergeä, rebasea, force-pushia, origin-pushia, Gate 2 -päätöstä tai Reviewer R5 -dispatchia.
 
 R5 TECHNICALLY VALIDATED — PRODUCTION AUTHORITY BLOCKED — AWAITING INDEPENDENT REVIEWER R5
+
+---
+
+# R6 corrective implementation — 2026-10-09
+
+Tila: `R6 TECHNICALLY VALIDATED — PRODUCTION AUTHORITY/DEPLOYMENT BLOCKED — AWAITING INDEPENDENT REVIEWER R6`
+
+Session: `@session:theseus-builder/20261009_061621_1e0e6e`
+
+- R5 code baseline: `dcb83f318959191f2b3bc7492d7802f2dbcf7f93`.
+- R5 evidence baseline: `002feaf6f1e6cdaa1972d2853e1477053e4837cd`.
+- R6 authorization lock / code parent: `8e6aacc2c591da7d36a6700472129fc35b392eed`.
+- R6 code SHA: `55fe9171cee560a632ca1948c9f7593200a15c60`.
+- Fork code readback: `55fe9171cee560a632ca1948c9f7593200a15c60` — MATCH.
+- Evidence/docs SHA: tämän R6-osion, päivitetyn authority contractin ja validation-osion sisältävän erillisen commitin SHA; exact SHA varmennetaan non-force pushin jälkeisessä remote-readbackissa, koska commit ei voi sisältää omaa tulevaa SHA:taan.
+- Branch: `fix/theseus-gateway-kanban-lifecycle-r6`.
+
+## R6-01–R6-03 correction matrix
+
+| Kohta | Tila | Toteutus |
+|---|---|---|
+| R6-01 Synthetic authority containment | IMPLEMENTED / VALIDATED | Kaikki toimitettavan lifecycle-moduulin synteettiset mutaatiohelperit, `SyntheticAuthorityTestConfiguration`, niiden importit ja kutsupolut inventoitiin. `_record_terminal_approval_for_test`, `_issue_fresh_terminal_approval_for_test`, `_create_role_task_for_test` ja `_resume_after_architect_decision_for_test` sekä caller-injektoitava test authority poistettiin `hermes_cli/kanban_theseus_lifecycle.py`:stä. Disposable signing/trust/principal -harness on vain testipuussa. Normaali production lifecycle -kutsuja, CLI tai Gateway ei voi käyttää sitä authority-eventin tai lifecycle-tilan kirjoittamiseen. |
+| R6-02 Role creation authorization | IMPLEMENTED / VALIDATED | Reviewer- ja Investigator-luonnin direct/native-, CLI- ja Gateway-reitit inventoitiin. Julkinen `create_role_task` fail-closed ennen ensimmäistä DB-writea molemmille rooleille. Auktorisoitu sisäinen rooliluonti tekee taskin, linkin, metadatan ja eventin samassa transaktiossa. Pakotettu event/audit failure rollbackaa kaiken ilman osittaista taskia tai linkkiä. |
+| R6-03 Stored approval expiry | IMPLEMENTED / VALIDATED | Stored approval tarkistetaan uudelleen claim/preflight-kulutuksessa. Raja on inklusiivinen: `now >= approval_expires_at` on expired. Ennen rajaa toimiva approval, exact boundary ja after-boundary testattiin. Expired approval ei luo runia, claim-eventtiä eikä persistent state transitionia. |
+
+## Todellinen prosessi- ja tietokantaoikeuksien trust boundary
+
+Containment ei perustu alaviivaan, `_for_test`-nimeen tai undocumented importiin. Mielivaltaista Python-koodia samassa luotetussa prosessissa ei turvallisuuseristetä importeilla: se voi monkeypatchata prosessia tai käyttää samoja tietokantaoikeuksia. Samoin suora SQLite-write-oikeus on trust boundaryn sisäpuolella. R6 poistaa synteettisen authority capabilityn normaalista toimitettavasta lifecycle/API/CLI/Gateway-pinnasta; se ei väitä sandboxaavansa jo valmiiksi luotettua arbitrary codea.
+
+## Koodicommitin muuttamat polut
+
+1. `hermes_cli/kanban_theseus_lifecycle.py`
+2. `tests/hermes_cli/kanban_lifecycle_authority_harness.py`
+3. `tests/hermes_cli/test_kanban_theseus_lifecycle.py`
+
+Ei authority contract-, evidence- tai muuta dokumenttia code commitissa. Ei schema-, migration-, table-, domain/API/UI/public-contract-, S123/S124-, desired-state-, production-board- tai production-authority-muutosta.
+
+## TDD ja exact code SHA -validointi
+
+- R6-rajojen ensimmäinen kohdennettu RED-ajo: exit `1` odotetuista puuttuvista containment/authorization/expiry-käyttäytymisistä.
+- Myöhemmät kohdennetut GREEN-ajot: exit `0`.
+- Exact clean code SHA `55fe9171cee560a632ca1948c9f7593200a15c60` focused authority/lifecycle: exit `0`; `90 passed, 0 failed`.
+- Affected Kanban/Gateway, 84 tiedostoa: exit `0`; `640 passed, 0 failed, 3 skipped`.
+- Retained R4-02/R4-03/R4-05/R3-06/R3-04 -regressiot: exit `0`; `17 passed, 0 failed`.
+- Isolated synthetic pilot: exit `0`; `1 passed`.
+- Ruff changed Python paths `--no-cache`: exit `0`; `All checks passed!`.
+- `git diff --check 8e6aacc2c591da7d36a6700472129fc35b392eed..55fe9171cee560a632ca1948c9f7593200a15c60`: exit `0`.
+- `gitleaks`, `trufflehog`, `detect-secrets`, `semgrep`: `NOT AVAILABLE`; ei scanner-PASS-väitettä.
+- Rajattu added-line/risk-pattern fallback: 0 credential-assignment-, `shell=True`-, `eval/exec`- tai pickle-load-osumaa.
+
+## Synthetic pilot, platformit ja historiallinen flake
+
+Synthetic pilot käytti disposable SQLite-kantaa, temporary worktree -polkuja ja synteettistä aliprosessia sekä teki run/PID/terminal-state readbackin. Se ei käyttänyt production issueria, tuotantoboardia eikä live Gatewayta.
+
+- Windows runtime: `NOT RUN` Linux-hostilla.
+- Kolme Windows-only-testiä: `SKIPPED`, eivät PASS.
+- Historiallinen `tests/gateway/test_kanban_wake_acceptance.py` first-attempt 300 s timeout säilyy `FLAKY`-luokituksena, vaikka current R6 exact-SHA -ajo läpäisi.
+
+## Open technical risks ja operational blockerit
+
+- Arbitrary code samassa luotetussa prosessissa ja suora DB-write-oikeus jäävät trust boundaryn sisään; R6 ei lisää prosessi- tai database sandboxia.
+- Tuotannon authenticated decision identity, hyväksytty issuer, production signing-key management, trusted public-key distribution/trust store, authoritative revocation/receipt store, cross-board replay policy, monitoring, retention, incident response ja rollout/canary-päätökset puuttuvat.
+- Production approval/decision/resume pysyy fail-closed: `BLOCKED — TRUSTED AUTHORITY NOT CONFIGURED`.
+- Live Gateway, production board, deployment ja live rollback: `NOT RUN`; niitä ei aktivoitu tai muutettu.
+- Näiden operational/deployment-riippuvuuksien ratkaiseminen vaatii erillisen Architect-päätöksen ja toteutusluvan; R6 ei laajenna tuotantoauktoriteettia.
+
+## Scope ja governance
+
+- Code commit on yksi erillinen code/test-commit; tämä evidence julkaistaan erillisenä docs-committina.
+- Ei mergeä, rebasea, force-pushia, origin-pushia tai remote-/credential-/SSH-konfiguraation muutosta.
+- Ei Reviewer R6 -dispatchia, R7-aloitusta, Gate 2 -hyväksyntää, sprintin sulkemista tai production activation readiness -väitettä.
+
+R6 TECHNICALLY VALIDATED — PRODUCTION AUTHORITY/DEPLOYMENT BLOCKED — AWAITING INDEPENDENT REVIEWER R6

@@ -1,8 +1,8 @@
-# Gateway/Kanban Lifecycle Hardening — auktoriteettisopimus R5
+# Gateway/Kanban Lifecycle Hardening — auktoriteettisopimus R6
 
 Tila: `BLOCKED — PRODUCTION AUTHORITY NOT AVAILABLE`
 
-Tämä sopimus erottaa toteutetun turvarajan, synteettisellä issuerilla testatun käyttäytymisen ja puuttuvan tuotantoauktoriteetin. Synteettinen onnistuminen ei ole tuotantoauktoriteetin onnistuminen. Asiakirja ei myönnä Gate 2:ta, merge-lupaa eikä live Gateway -aktivointia.
+Tämä sopimus erottaa toteutetun turvarajan, testipuuhun rajatulla synteettisellä issuerilla testatun käyttäytymisen ja puuttuvan tuotantoauktoriteetin. Synteettinen onnistuminen ei ole tuotantoauktoriteetin onnistuminen. Asiakirja ei myönnä Gate 2:ta, merge-lupaa eikä live Gateway -aktivointia.
 
 ## 1. IMPLEMENTED
 
@@ -38,27 +38,41 @@ Audit sisältää vähintään issuerin, noncen, evidenssidigestin, actionin, sc
 
 Toteutus käyttää nykyisiä `task_events`- ja task-rakenteita. Se ei lisää skeemaa, taulua tai migraatiota.
 
-## 2. TESTED WITH SYNTHETIC ISSUER
+### R6-korjausmatriisi
 
-Testit generoivat prosessin sisäisen disposable Ed25519-avaimen ja injektoivat `SyntheticAuthorityTestConfiguration`-olion vain eksplisiittisellä `_test_authority`-parametrilla. CLI- ja Gateway-polut eivät välitä tätä parametria ja hylkäävät synteettisen evidenssin tuotantopolkuna.
+| Kohta | Tila | Toteutettu raja |
+|---|---|---|
+| R6-01 Synthetic authority containment | IMPLEMENTED / VALIDATED | `SyntheticAuthorityTestConfiguration` sekä `_record_terminal_approval_for_test`, `_issue_fresh_terminal_approval_for_test`, `_create_role_task_for_test` ja `_resume_after_architect_decision_for_test` poistettiin toimitettavasta `hermes_cli`-moduulista. Disposable key-, issuer-, trust-root- ja principal-rakennus on vain `tests/hermes_cli/kanban_lifecycle_authority_harness.py`:ssä. Normaali production lifecycle -kutsuja ei voi toimittaa synteettistä verifieria tai caller-controlled trust materiaalia mutaatiopolulle. |
+| R6-02 Role creation authorization | IMPLEMENTED / VALIDATED | Julkinen `create_role_task` hylkää sekä `reviewer`- että `investigator`-luonnin ennen ensimmäistä tietokantakirjoitusta. Sisäinen auktorisoitu testipolku suorittaa taskin, linkin, metadatan ja eventin yhdessä transaktiossa; pakotettu event/audit-virhe rollbackaa kaiken. CLI ja Gateway käyttävät samoja lifecycle-polkuja eivätkä saa vaihtoehtoista roolinluontiohitusta. |
+| R6-03 Stored approval expiry | IMPLEMENTED / VALIDATED | Tallennettu approval validoidaan uudelleen claim/preflight-kulutusrajalla. `now >= approval_expires_at` on vanhentunut. Ennen rajaa approval voidaan kuluttaa; täsmälleen rajalla ja rajan jälkeen ei synny runia, claim-eventtiä eikä pysyvää tilasiirtymää. |
+
+### Todellinen trust boundary
+
+Tuotannon turvallisuusraja ei ole Python-symbolin nimi, alaviiva, undocumented import tai testihakemiston importtipolku. Prosessi, jolla on oikeus ajaa mielivaltaista Pythonia samassa Hermes-prosessissa tai kirjoittaa Kanbanin SQLite-tietokantaan, kuuluu luotettuun computing/database-rights -rajaan: tällainen koodi voi muuttaa muistia, monkeypatchata funktioita tai kirjoittaa tietokantaan suoraan, eikä import-raja turvallisuuseristä sitä.
+
+R6-01:n containment-takuu on rajatumpi ja todennettava: toimitettava normaali lifecycle-API, CLI ja Gateway eivät tarjoa caller-controlled synthetic issuer/trust root/key/principal -kyvykkyyttä eivätkä synteettistä mutaatio-entrypointia. Testiharness ei ole production API eikä security sandbox. Prosessi- ja tietokantaoikeuksien eristäminen, production identity sekä authority service ovat erillisiä operational/deployment-riippuvuuksia.
+
+## 2. TESTED WITH TEST-TREE SYNTHETIC ISSUER
+
+Testit generoivat disposable Ed25519-avaimen testipuun `kanban_lifecycle_authority_harness.py`-moduulissa. Harness kutsuu sisäistä same-transaction-mutaatiota vain testissä. Toimitettava `hermes_cli.kanban_theseus_lifecycle` ei sisällä `SyntheticAuthorityTestConfiguration`-luokkaa, `_for_test`-mutaatiowrappereita eikä `_test_authority`-parametria. CLI- ja Gateway-polut eivät voi välittää testiharnessia ja pysyvät tuotantopolkuna fail-closed.
 
 Synteettisellä issuerilla on testattu:
 
-- validi approval, fresh approval, Architect resume ja Investigator-päätös;
+- validi approval, fresh approval, Architect resume sekä Reviewer/Investigator-roolilinkitys testiharnessissa;
 - issuer authorization sekä approver/architect-roolisidonta;
 - allekirjoitus, action, type, scope, package, task, run, STOP-token ja code SHA;
 - malformed-, missing-, bool-integer- ja safe-range-tapaukset;
-- expiry-raja `now == expires_at`;
+- stored approval ennen expiry-rajaa, täsmälleen rajalla `now == approval_expires_at` ja rajan jälkeen;
 - unknown issuer, valtuuttamaton principal, revoked issuer/key/nonce ja forged signature;
 - replay sekä samanaikaiset yritykset, joista vain yksi saa atomisen kulutuksen ja tilasiirtymän;
 - caller-metadatan kyvyttömyys korjata väärää allekirjoitettua scopea;
 - CLI-, Gatewayn yhteisen slash-polun, Python native -kutsun ja suoran lifecycle-mutaation fail-closed-käyttäytyminen.
 
-Synteettinen private key on vain testikoodissa. Sitä ei toimiteta konfiguraationa, trust storena, issuer-palveluna, ympäristömuuttujana tai live Gatewayn käyttöön. Synteettiset principalit eivät ole tuotantoidentiteettejä.
+Synteettinen private key ja trust-map ovat vain testikoodissa. Niitä ei toimiteta konfiguraationa, trust storena, issuer-palveluna, ympäristömuuttujana tai live Gatewayn käyttöön. Synteettiset principalit eivät ole tuotantoidentiteettejä. Testipuuhun siirtäminen vähentää toimitettavaa capability-pintaa, mutta ei väitä eristävän mielivaltaista koodia, jolla jo on samat prosessi- tai tietokantaoikeudet.
 
 ## 3. BLOCKED — PRODUCTION AUTHORITY NOT AVAILABLE
 
-Tuotantoon ei ole konfiguroitu eikä tässä R5:ssä luotu:
+Tuotantoon ei ole konfiguroitu eikä tässä R6:ssa luotu:
 
 1. server-side authenticated päätösidentiteettiä;
 2. Arkkitehdin hyväksymää production issueria;
@@ -87,7 +101,7 @@ Tuotantoblokin poistaminen vaatii erillisen Architect-päätöksen ja uuden raja
 - toteuttaa production-only configuration loader, joka ei hyväksy testikonfiguraatiota;
 - tehdä canary-rollout erillisellä luvalla ja riippumattomalla katselmuksella.
 
-Nykyinen R5 ei toteuta tai aktivoi näitä riippuvuuksia.
+Nykyinen R6 ei toteuta tai aktivoi näitä riippuvuuksia.
 
 ## 4. Allekirjoitusavainten hallintaraja
 
