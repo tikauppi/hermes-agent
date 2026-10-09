@@ -20,6 +20,7 @@ from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_theseus_lifecycle as glh
 from hermes_cli.kanban_authority_verifier import AuthorityVerifier
+from tests.hermes_cli import kanban_lifecycle_authority_harness as authority_harness
 
 
 _TEST_AUTHORITY_KEY = Ed25519PrivateKey.generate()
@@ -28,7 +29,7 @@ _TEST_AUTHORITY_KEY_ID = "synthetic-r5-key-1"
 _TEST_APPROVER = "synthetic-r5-approver"
 _TEST_ARCHITECT = "synthetic-r5-architect"
 _TEST_NONCES = itertools.count(1)
-_TEST_AUTHORITY = glh.SyntheticAuthorityTestConfiguration(
+_TEST_AUTHORITY = authority_harness.SyntheticAuthority(
     AuthorityVerifier(
         trusted_keys={
             (_TEST_AUTHORITY_ISSUER, _TEST_AUTHORITY_KEY_ID):
@@ -100,8 +101,8 @@ def _approve(conn, task_id: str, *, expires_at: int = 150, evidence: str | None 
         principal_role="approver",
         expires_at=expires_at,
     )
-    return glh._record_terminal_approval_for_test(
-        conn, task_id, authority_evidence=evidence, test_authority=_TEST_AUTHORITY
+    return authority_harness.approve(
+        conn, task_id, authority_evidence=evidence, authority=_TEST_AUTHORITY
     )
 
 
@@ -115,8 +116,8 @@ def _fresh_approve(conn, task_id: str, *, expires_at: int = 200):
         principal_role="approver",
         expires_at=expires_at,
     )
-    return glh._issue_fresh_terminal_approval_for_test(
-        conn, task_id, authority_evidence=evidence, test_authority=_TEST_AUTHORITY
+    return authority_harness.fresh_approve(
+        conn, task_id, authority_evidence=evidence, authority=_TEST_AUTHORITY
     )
 
 
@@ -133,27 +134,26 @@ def _resume(conn, task_id: str, *, evidence: str | None = None):
         run_id=int(stop["stopped_run_id"]),
         stop_token=stop["stop_token"],
     )
-    return glh._resume_after_architect_decision_for_test(
-        conn, task_id, authority_evidence=evidence, test_authority=_TEST_AUTHORITY
+    return authority_harness.resume(
+        conn, task_id, authority_evidence=evidence, authority=_TEST_AUTHORITY
     )
 
 
 def _create_role_task(conn, **kwargs):
-    if kwargs.get("role") == "investigator":
-        builder_task_id = kwargs["builder_task_id"]
-        evidence = _signed_authority(
-            conn,
-            builder_task_id,
-            action="create_investigator_task",
-            evidence_type="architect_decision",
-            principal=_TEST_ARCHITECT,
-            principal_role="architect",
-        )
-        kwargs["authority_evidence"] = evidence
-        kwargs["test_authority"] = _TEST_AUTHORITY
-        kwargs.pop("authorization_ref", None)
-        return glh._create_role_task_for_test(conn, **kwargs)
-    return glh.create_role_task(conn, **kwargs)
+    role = kwargs["role"]
+    builder_task_id = kwargs["builder_task_id"]
+    evidence = _signed_authority(
+        conn,
+        builder_task_id,
+        action=f"create_{role}_task",
+        evidence_type="architect_decision",
+        principal=_TEST_ARCHITECT,
+        principal_role="architect",
+    )
+    kwargs["authority_evidence"] = evidence
+    kwargs["authority"] = _TEST_AUTHORITY
+    kwargs.pop("authorization_ref", None)
+    return authority_harness.create_role_task(conn, **kwargs)
 
 
 @pytest.fixture
@@ -274,6 +274,83 @@ def test_public_lifecycle_rejects_synthetic_test_configuration(lifecycle_db):
     )
 
 
+def test_shipped_lifecycle_exposes_no_synthetic_authority_mutation_surface():
+    assert not hasattr(glh, "SyntheticAuthorityTestConfiguration")
+    assert not hasattr(glh, "_record_terminal_approval_for_test")
+    assert not hasattr(glh, "_issue_fresh_terminal_approval_for_test")
+    assert not hasattr(glh, "_create_role_task_for_test")
+    assert not hasattr(glh, "_resume_after_architect_decision_for_test")
+
+
+@pytest.mark.parametrize("role", ["reviewer", "investigator"])
+def test_public_role_creation_is_blocked_before_any_database_write(lifecycle_db, role):
+    conn, tmp_path = lifecycle_db
+    builder_id = _builder(conn, tmp_path)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (builder_id,))
+    role_path = tmp_path / f"blocked-{role}-wt"
+    role_path.mkdir()
+    before = "\n".join(conn.iterdump())
+
+    with pytest.raises(ValueError, match="^BLOCKED — TRUSTED AUTHORITY NOT CONFIGURED$"):
+        glh.create_role_task(
+            conn,
+            builder_task_id=builder_id,
+            role=role,
+            title=f"Blocked {role}",
+            candidate_sha="b" * 40,
+            branch=f"pilot/blocked-{role}",
+            worktree=str(role_path),
+            authority_evidence="caller-controlled",
+        )
+
+    assert "\n".join(conn.iterdump()) == before
+
+
+@pytest.mark.parametrize("role", ["reviewer", "investigator"])
+def test_authorized_role_creation_rolls_back_authority_and_all_role_writes(
+    lifecycle_db, monkeypatch, role
+):
+    conn, tmp_path = lifecycle_db
+    builder_id = _builder(conn, tmp_path)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (builder_id,))
+    role_path = tmp_path / f"rollback-{role}-wt"
+    role_path.mkdir()
+    monkeypatch.setattr(
+        glh,
+        "_read_git_identity",
+        lambda path: {
+            "root": str(Path(path).resolve()),
+            "branch": f"pilot/rollback-{role}",
+            "head": "b" * 40,
+            "parent": "a" * 40,
+        },
+    )
+    before = "\n".join(conn.iterdump())
+    original_append = kb._append_event
+
+    def fail_final_audit(conn_arg, task_id, kind, payload, **kwargs):
+        if kind == "theseus_role_task_linked":
+            raise RuntimeError("forced role audit failure")
+        return original_append(conn_arg, task_id, kind, payload, **kwargs)
+
+    monkeypatch.setattr(kb, "_append_event", fail_final_audit)
+
+    with pytest.raises(RuntimeError, match="forced role audit failure"):
+        _create_role_task(
+            conn,
+            builder_task_id=builder_id,
+            role=role,
+            title=f"Rollback {role}",
+            candidate_sha="b" * 40,
+            branch=f"pilot/rollback-{role}",
+            worktree=str(role_path),
+        )
+
+    assert "\n".join(conn.iterdump()) == before
+
+
 def test_direct_phase_transition_cannot_bypass_authority_boundary(lifecycle_db):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
@@ -306,11 +383,11 @@ def test_signed_wrong_scope_and_caller_metadata_cannot_authorize(lifecycle_db):
     )
 
     with pytest.raises(ValueError, match="binding"):
-        glh._record_terminal_approval_for_test(
+        authority_harness.approve(
             conn,
             task_id,
             authority_evidence=wrong_scope,
-            test_authority=_TEST_AUTHORITY,
+            authority=_TEST_AUTHORITY,
             approval_ref="caller-cannot-repair-scope",
             actor="architect",
         )
@@ -672,6 +749,75 @@ def test_glh_03_expired_approval_never_creates_run_or_pid(lifecycle_db, monkeypa
     assert [item[0] for item in fresh.spawned] == [task_id]
 
 
+@pytest.mark.parametrize(
+    ("now", "allowed"),
+    [(149, True), (150, False), (151, False)],
+)
+def test_stored_approval_expiry_is_exclusive_at_claim_boundary(
+    lifecycle_db, monkeypatch, now, allowed
+):
+    conn, tmp_path = lifecycle_db
+    task_id = _builder(conn, tmp_path)
+    assert _approve(conn, task_id, expires_at=150)
+
+    monkeypatch.setattr(glh.time, "time", lambda: now)
+
+    assert (glh._approval_for_claim(conn, task_id) is not None) is allowed
+    assert glh.dispatch_preflight(conn, task_id) == (
+        allowed,
+        None if allowed else "approval_expired",
+    )
+
+
+def test_exact_expiry_dispatch_creates_no_run_claim_or_state_transition(
+    lifecycle_db, monkeypatch
+):
+    conn, tmp_path = lifecycle_db
+    task_id = _builder(conn, tmp_path)
+    assert _approve(conn, task_id, expires_at=150)
+    before_task = kb.get_task(conn, task_id)
+    before_events = [(event.kind, event.payload) for event in kb.list_events(conn, task_id)]
+    monkeypatch.setattr(glh.time, "time", lambda: 150)
+
+    dispatched = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 99997)
+
+    after_task = kb.get_task(conn, task_id)
+    assert before_task is not None
+    assert after_task is not None
+    assert dispatched.spawned == []
+    assert kb.list_runs(conn, task_id) == []
+    assert (after_task.status, after_task.current_step_key) == (
+        before_task.status,
+        before_task.current_step_key,
+    )
+    assert [(event.kind, event.payload) for event in kb.list_events(conn, task_id)] == before_events
+
+
+def test_exact_expiry_native_claim_creates_no_run_or_state_transition(
+    lifecycle_db, monkeypatch
+):
+    conn, tmp_path = lifecycle_db
+    task_id = _builder(conn, tmp_path)
+    assert _approve(conn, task_id, expires_at=150)
+    before_task = kb.get_task(conn, task_id)
+    assert before_task is not None
+    monkeypatch.setattr(glh.time, "time", lambda: 150)
+
+    assert kb.claim_task(conn, task_id) is None
+
+    after_task = kb.get_task(conn, task_id)
+    assert after_task is not None
+    assert kb.list_runs(conn, task_id) == []
+    assert (after_task.status, after_task.current_step_key) == (
+        before_task.status,
+        before_task.current_step_key,
+    )
+    assert not any(
+        event.kind in {"claimed", "spawned", "theseus_approval_consumed"}
+        for event in kb.list_events(conn, task_id)
+    )
+
+
 def test_native_claim_unblock_and_promote_cannot_bypass_terminal_approval(lifecycle_db):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
@@ -761,7 +907,7 @@ def test_resume_rejects_forged_actor_and_actual_git_mismatch(lifecycle_db, monke
     stop = glh._event_payload(conn, task_id, "theseus_architect_stop")
     assert stop is not None
     with pytest.raises(ValueError, match="Git identity"):
-        glh._resume_after_architect_decision_for_test(
+        authority_harness.resume(
             conn,
             task_id,
             authority_evidence=_signed_authority(
@@ -774,7 +920,7 @@ def test_resume_rejects_forged_actor_and_actual_git_mismatch(lifecycle_db, monke
                 run_id=int(run_id),
                 stop_token=stop["stop_token"],
             ),
-            test_authority=_TEST_AUTHORITY,
+            authority=_TEST_AUTHORITY,
         )
 
 
