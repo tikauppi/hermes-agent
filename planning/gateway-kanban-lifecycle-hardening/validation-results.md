@@ -183,3 +183,74 @@ Nämä SHA-256-arvot ovat ulkoisten raporttien Phase A -tilanne juuri ennen täm
 - Gate 2: `PENDING INDEPENDENT REVIEWER R2`.
 
 Builderin tekninen validointi ei ole Arkkitehdin hyväksyntä.
+
+---
+
+# R3 corrective validation — 2026-10-09
+
+Tila: `PARTIALLY_BLOCKED_AWAITING_INDEPENDENT_REVIEWER_R3`
+
+Session: `@session:theseus-builder/20261009_034127_37677e`
+
+R3 code SHA: `3cfc86168ba6560a42fa0696032e150fc231e8c8`
+
+Fork code readback: `3cfc86168ba6560a42fa0696032e150fc231e8c8` — MATCH
+
+Evidence SHA: tämän R3-osion ja `implementation-results.md`:n sisältävän evidence/docs-commitin SHA; exact arvo todennetaan vasta commitin muodostamisen jälkeen remote-readbackissa, koska commit ei voi sisältää omaa tulevaa SHA:taan.
+
+R2 report SHA-256: `66f4ab74bf587a5970ddd1e120167df9c62637cb3fbb1a89085467d755ba1fdf` — MATCH
+
+## R3 disposition
+
+| R3 | Tila | Validointi |
+|---|---|---|
+| R3-01 | `BLOCKED — ARCHITECT DECISION REQUIRED` | Puuttuva trust-anchor-päätös on luotettu server-side authenticated approval/decision principal + authoritative receipt issuer/store. Caller-controlled `actor`, `approval_ref`, `approved_at` tai `decision_ref` ei kelpaa. Sopivaa olemassa olevaa Hermes-lähdettä ei löytynyt, joten uutta auktoriteettia tai julkista sopimusta ei keksitty. |
+| R3-02 | IMPLEMENTED / VALIDATED | Dispatcher-only native claim grant, role/profile/read-only capability -tarkistus, atomisen claimin active-peer-hylkäys sekä schema/native tool allowlist. Wrong capability, direct native bypass ja concurrent peer testattu. |
+| R3-03 | IMPLEMENTED / VALIDATED | Koko directory chain device/inode -sidonta prepare→finalize, descriptor-relative `O_NOFOLLOW`, hardlink+ancestor replacement -hylkäys, manifest containment ja failure cleanup. |
+| R3-04 | IMPLEMENTED / VALIDATED | Designated `theseus-builder` -profiili tarkistetaan lifecycle preflightissa ja native claimissa. Wrong/missing profile, standalone dispatch ja direct bypass testattu; legacy pass-through säilyy. |
+| R3-05 | IMPLEMENTED / VALIDATED | Bind-False ja bind-exception käsittelevät vain identity-verified uuden childin; unverified/PID-reuse no-kill sekä retry/run-integrity testattu. |
+| R3-06 | IMPLEMENTED / VALIDATED | Dry-run ohittaa reclaim/orphan/crash/timeout/promotion/recompute-ready/WAL checkpoint -kirjoitukset; täydellinen DB dump + artifact tree pysyy identtisenä ja repeatable reclaimable/promotable-fixtureillä. |
+
+R3-01:n vuoksi Builder ei väitä Gate 2 -valmiutta.
+
+## TDD RED → GREEN
+
+- R3-02 testit `test_role_native_claim_rejects_wrong_capability_and_active_peer` ja `test_role_worker_capabilities_are_enforced_at_schema_and_native_dispatch`: RED exit `1`, GREEN exit `0`.
+- R3-03 testit `test_artifacts_reject_prepare_finalize_ancestor_replacement_with_hardlinks` ja `test_artifact_manifest_write_failure_removes_partial_file`: RED exit `1`, GREEN exit `0`.
+- R3-04 `test_all_dispatch_and_native_claim_routes_reject_non_designated_host`: RED exit `1`, GREEN exit `0`.
+- R3-05 `test_pid_bind_exception_terminates_verified_child_and_preserves_retry_integrity`: RED exit `1`, GREEN exit `0`.
+- R3-06 `test_lifecycle_dry_run_is_byte_for_byte_non_mutating`: RED exit `1`, GREEN exit `0`.
+
+## Exact code SHA -ajot
+
+1. Focused R3/GLH:
+   - Komento: `HERMES_PYTHON=/opt/data/cache/glh-r1-20261009-venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_kanban_theseus_lifecycle.py -q --tb=short -p no:cacheprovider`
+   - Exit `0`; `42 passed, 0 failed`.
+2. Affected Kanban/Gateway:
+   - Komento: `HERMES_PYTHON=/opt/data/cache/glh-r1-20261009-venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_kanban*.py tests/gateway/test_kanban*.py tests/plugins/test_kanban*.py tests/tools/test_kanban*.py tests/agent/test_kanban*.py tests/tui_gateway/test_kanban*.py -q --tb=short -p no:cacheprovider`
+   - Exit `0`; `592 passed, 0 failed, 3 skipped`, 83 tiedostoa.
+   - Kolme skip-tapausta ovat Windows-only; `SKIPPED`, ei PASS.
+3. Isolated synthetic pilot:
+   - Selector `isolated_pilot_uses_synthetic_subprocess_and_run_readback`.
+   - Exit `0`; `1 passed`.
+4. Ruff changed Python paths `--no-cache`: exit `0`; `All checks passed!`.
+5. `git diff --check 03ddc791f935f4f4d9534f90df1bb9481dc7369a..3cfc86168ba6560a42fa0696032e150fc231e8c8`: exit `0`.
+6. Third-party secret scanner: `NOT AVAILABLE` (`gitleaks`, `trufflehog`, `detect-secrets`, `semgrep` puuttuivat); ei PASS-väitettä.
+
+## Flake/skips/no-live
+
+- Aiempi ensimmäisen yrityksen 300 s `test_kanban_wake_acceptance.py` timeout säilyy `FLAKY`-tilassa; current exact-SHA full suite läpäisi.
+- Kolme Windows-only-testiä: `SKIPPED`, ei PASS.
+- Live Gateway ja live rollback: `NOT RUN` rajauksen vuoksi.
+- Production board: `NOT RUN` / ei käytetty.
+- Synthetic pilot käytti vain disposable SQLitea, temporary worktree -polkuja ja synteettistä aliprosessia.
+
+## Report/result ja scope
+
+- Builder report SHA-256: `06e411b8cbd8d6b1f8992ba793f3e9d7fbf205ff1dd1fbd2fc8e074a902555b5`.
+- Builder result SHA-256: `61ce290667e3d4bff71ced733475dbc210d106d8fd13235b449a6962934b335f`.
+- Origin säilyi `https://github.com/NousResearch/hermes-agent.git` eikä originia pushattu.
+- Ei S123/S124-, migraatio-, taulu-, `work_packages`-, desired-state-, profiili- tai production-board-muutosta.
+- Ei mergeä, rebasea, force-pushia, live-aktivointia, Reviewer-dispatchia tai Gate 2 -päätöstä.
+
+R3 CORRECTIONS COMPLETE OR PARTIALLY BLOCKED — AWAITING INDEPENDENT REVIEWER R3
