@@ -1,8 +1,14 @@
 # Gateway/Kanban Lifecycle Hardening — auktoriteettisopimus R6
 
-Tila: `BLOCKED — PRODUCTION AUTHORITY NOT AVAILABLE`
+Tekninen Gate 2: `GATE2_TECHNICAL_APPROVED`
 
-Tämä sopimus erottaa toteutetun turvarajan, testipuuhun rajatulla synteettisellä issuerilla testatun käyttäytymisen ja puuttuvan tuotantoauktoriteetin. Synteettinen onnistuminen ei ole tuotantoauktoriteetin onnistuminen. Asiakirja ei myönnä Gate 2:ta, merge-lupaa eikä live Gateway -aktivointia.
+Production authority: `BLOCKED — PRODUCTION AUTHORITY NOT AVAILABLE`
+
+Production activation: `PRODUCTION_ACTIVATION_BLOCKED`
+
+Integraatio: `INTEGRATION_NOT_AUTHORIZED`
+
+Tämä sopimus erottaa toteutetun turvarajan, testipuuhun rajatulla synteettisellä issuerilla testatun käyttäytymisen ja puuttuvan tuotantoauktoriteetin. Synteettinen onnistuminen ei ole tuotantoauktoriteetin onnistuminen. Arkkitehti on hyväksynyt teknisen Gate 2:n immutable B-01 evidence-baselinelle `137dfce970986bf8d2822358f5ab9bc17ee334a8`; tekninen hyväksyntä ei myönnä production activationia, merge-lupaa eikä live Gateway -aktivointia.
 
 ## 1. IMPLEMENTED
 
@@ -46,7 +52,7 @@ Toteutus käyttää nykyisiä `task_events`- ja task-rakenteita. Se ei lisää s
 |---|---|---|
 | R6-01 Synthetic authority containment | IMPLEMENTED / VALIDATED | `SyntheticAuthorityTestConfiguration` sekä `_record_terminal_approval_for_test`, `_issue_fresh_terminal_approval_for_test`, `_create_role_task_for_test` ja `_resume_after_architect_decision_for_test` poistettiin toimitettavasta `hermes_cli`-moduulista. Disposable key-, issuer-, trust-root- ja principal-rakennus on vain `tests/hermes_cli/kanban_lifecycle_authority_harness.py`:ssä. Normaali production lifecycle -kutsuja ei voi toimittaa synteettistä verifieria tai caller-controlled trust materiaalia mutaatiopolulle. |
 | R6-02 Role creation authorization | IMPLEMENTED / VALIDATED | Julkinen `create_role_task` hylkää sekä `reviewer`- että `investigator`-luonnin ennen ensimmäistä tietokantakirjoitusta. Sisäinen auktorisoitu testipolku suorittaa taskin, linkin, metadatan ja eventin yhdessä transaktiossa; pakotettu event/audit-virhe rollbackaa kaiken. CLI ja Gateway käyttävät samoja lifecycle-polkuja eivätkä saa vaihtoehtoista roolinluontiohitusta. |
-| R6-03 Stored approval expiry / B-01 | CORRECTED / BUILDER VALIDATED — AWAITING INDEPENDENT POST-CORRECTION REVIEW | Tallennettu approval validoidaan uudelleen claim/preflight-kulutusrajalla. `now >= approval_expires_at` on vanhentunut. Ennen rajaa approval voidaan kuluttaa; täsmälleen rajalla ja rajan jälkeen dispatch/preflight sekä native claim eivät synnytä runia, claim-eventtiä, task-siirtymää tai muuta pysyvää Kanban-muutosta. Builderin validointi ei korvaa riippumatonta katselmusta. |
+| R6-03 Stored approval expiry / B-01 | CORRECTED / INDEPENDENTLY REVIEWED / CLOSED | Tallennettu approval validoidaan uudelleen claim/preflight-kulutusrajalla. `now >= approval_expires_at` on vanhentunut. Ennen rajaa approval voidaan kuluttaa; täsmälleen rajalla ja rajan jälkeen dispatch/preflight sekä native claim eivät synnytä runia, claim-eventtiä mukaan lukien `claim_rejected`, task-siirtymää tai muuta pysyvää Kanban-muutosta. Independent post-correction Reviewer `APPROVED` tämän `137dfce970986bf8d2822358f5ab9bc17ee334a8` evidence-baselinella; Arkkitehti hyväksyi teknisen Gate 2:n, mutta production activation ja integraatio eivät sisälly päätökseen. |
 
 ### Todellinen trust boundary
 
