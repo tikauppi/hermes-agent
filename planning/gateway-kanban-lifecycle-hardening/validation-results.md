@@ -337,3 +337,100 @@ Session: `@session:theseus-builder/20261009_043005_0f4e02`
 Builder pysähtyy riippumattomaan Reviewer R4 -katselmukseen.
 
 R4 CORRECTIONS COMPLETE OR PARTIALLY BLOCKED — AWAITING INDEPENDENT REVIEWER R4
+
+---
+
+# R5 corrective validation — 2026-10-09
+
+Tila: `R5 TECHNICALLY VALIDATED — PRODUCTION AUTHORITY BLOCKED`
+
+Session: `@session:theseus-builder/20261009_051058_6d682d`
+
+- Base/evidence: `44a7c25d5709798bbae567e9743a004089dbda1f`.
+- R4 code: `6bcaa640a5b0df3fedc309429ec494e628d10f65`.
+- R5 code SHA: `dcb83f318959191f2b3bc7492d7802f2dbcf7f93`.
+- Fork code readback: MATCH.
+- Evidence/docs SHA: tämän R5-osion ja päivitetyn `implementation-results.md`:n sisältävä evidence commit. Exact SHA varmennetaan pushin jälkeisessä remote-readbackissa, koska commit ei voi sisältää omaa tulevaa SHA:taan.
+
+## R5-validointimatriisi
+
+| Kohta | Tila | Exact clean code SHA -evidenssi |
+|---|---|---|
+| R5-DEC-01 / R5-01 | IMPLEMENTED + SYNTHETICALLY TESTED; production BLOCKED | Public production API, CLI ja Gateway slash -polku fail-closed; private test-only injection harjoittaa common same-transaction mutation boundarya. Signed binding, audit, atomic receipt+transition, replay ja concurrency PASS. |
+| R5-02 | PASS | Genuine JSON int/not-bool, safe range/order, exact expiry boundary, malformed/missing, unknown issuer, unauthorized principal, wrong scope/action/type/target, forged signature, revoked issuer/key/nonce ja replay/concurrency PASS. |
+| R4-02 | PASS / preserved | Native/dispatcher claim, role/profile/read-only, active peer, designated host ja legacy regressiot PASS. |
+| R4-03 | PASS Linux/POSIX / preserved | Artifact identity, symlink/hardlink/replacement, fsync, no-replace, failure cleanup ja unsupported-boundary regressiot PASS. Windows runtime `NOT RUN`. |
+| R4-05 | PASS Linux / preserved | pidfd birth identity, bind failure/exception, manual fence ja retry prevention PASS. |
+| R3-06 | PASS / preserved | Byte-for-byte dry-run DB/artifact non-mutation PASS. |
+
+## Exact clean code SHA -komennot ja exitit
+
+Kaikki kanoniset tulokset ajettiin puhtaasta `dcb83f318959191f2b3bc7492d7802f2dbcf7f93`-checkoutista.
+
+1. Focused R5 security/lifecycle:
+   - Komento: `HERMES_PYTHON=/opt/data/cache/glh-r1-20261009-venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_kanban_authority_verifier.py tests/hermes_cli/test_kanban_theseus_lifecycle.py -q --tb=short -p no:cacheprovider`
+   - Exit `0`; 2 tiedostoa; `80 passed, 0 failed`; verifier 26, lifecycle 54; 5.4 s.
+2. Affected GLH/Kanban/Gateway regressiot:
+   - Komento: `HERMES_PYTHON=/opt/data/cache/glh-r1-20261009-venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_kanban*.py tests/gateway/test_kanban*.py tests/plugins/test_kanban*.py tests/tools/test_kanban*.py tests/agent/test_kanban*.py tests/tui_gateway/test_kanban*.py -q --tb=short -p no:cacheprovider`
+   - Exit `0`; 84 tiedostoa; `630 passed, 0 failed, 3 skipped`; 38.9 s.
+   - Kolme skip-tapausta ovat Windows-only: `SKIPPED`, eivät PASS.
+3. Synthetic pilot:
+   - Sama canonical runner; selector `isolated_pilot_uses_synthetic_subprocess_and_run_readback`.
+   - Exit `0`; `1 passed`; 1.3 s.
+4. Ruff muuttuneille Python-poluille:
+   - `/opt/data/cache/glh-r1-20261009-venv/bin/python -m ruff check --no-cache hermes_cli/kanban.py hermes_cli/kanban_authority_verifier.py hermes_cli/kanban_parser.py hermes_cli/kanban_theseus_lifecycle.py tests/hermes_cli/test_kanban_authority_verifier.py tests/hermes_cli/test_kanban_theseus_lifecycle.py`
+   - Exit `0`; `All checks passed!`.
+5. Diff:
+   - `git diff --check 44a7c25d5709798bbae567e9743a004089dbda1f..dcb83f318959191f2b3bc7492d7802f2dbcf7f93`
+   - Exit `0`.
+
+## TDD RED → GREEN
+
+R5-korjaukset toteutettiin käyttäytymiskohtaisesti testit ensin. Tallennetut RED-exitit sisälsivät unknown principal -authorizationin, caller-controlled Investigator-refin, direct protected phase transition -ohituksen ja julkisen production entrypointin validin synthetic configuration -ohituksen. Public synthetic -tapauksen RED: exit `1`, `DID NOT RAISE ValueError`; GREEN sisältyy clean-SHA focused-ajon 80 PASSiin. Testejä tai kriteereitä ei lievennetty.
+
+## Synthetic issuer -raja
+
+Synthetic private key luodaan vain testiprosessissa disposable fixtureksi. Private test-only wrapperit välittävät verifierin mutation boundarylle. Public production lifecycle -entrypointit eivät hyväksy testikonfiguraatiota; CLI ja Gateway eivät voi välittää sitä. Synthetic pilot ei ole production authority success.
+
+Production status:
+
+`BLOCKED — TRUSTED AUTHORITY NOT CONFIGURED`
+
+## Authority contract ja hashit
+
+- `authority-contract.md` SHA-256: `00e4af41d4493155c82c5278bb48482e190905a21108e6bacd1531aacbb92b92`.
+- R5 Builder report `/opt/data/logs/glh-r5-builder-20261009.report.md` SHA-256: `7c933bc445f430d5097c6b79cd743dacf8b7341e35a74a100d0b8427450c2bd8`.
+- R5 Builder result `/opt/data/logs/glh-r5-builder-20261009.result.md` SHA-256: `32430d8154cd06f7df23ea90c75804ec9e193a1868e9f4c6bb160cf952386be3`.
+- Reviewer R4 report SHA-256: `0be26f1125deac07af5b563ffdcd010b33bec012f96685217e1b5b42bffacedc` — MATCH.
+- Reviewer R4 result SHA-256: `e5ed1470a7906a3e4afaac826f772d7ecc9fae9b547d5a6a2e5a7016640a3b7d` — MATCH.
+
+## Scannerit
+
+- `gitleaks`: `NOT AVAILABLE`.
+- `trufflehog`: `NOT AVAILABLE`.
+- `detect-secrets`: `NOT AVAILABLE`.
+- `semgrep`: `NOT AVAILABLE`.
+- Rajattu credential/private-key/dangerous-Python-regexhaku muuttuneesta diffistä: 0 osumaa.
+
+Scannerien puuttumista ei merkitä PASSiksi.
+
+## FLAKY, skips ja no-live
+
+- Historiallinen `tests/gateway/test_kanban_wake_acceptance.py` 300 s first-attempt timeout säilyy `FLAKY`. R5:n pre-commit-ajossa first attempt timeouttasi ja canonical retry tuotti `3 passed`; exact clean-SHA -ajossa sama tiedosto läpäisi ensimmäisellä yrityksellä (`3 passed`, 3.8 s). Historiaa ei pyyhitty.
+- Windows-only: 3 `SKIPPED`; Windows artifact runtime `NOT RUN` Linux-hostilla.
+- Live Gateway: `NOT RUN`; ei käynnistetty tai aktivoitu.
+- Production board ja live rollback: `NOT RUN`.
+- Production issuer/signing key/trust store/revocation service: `NOT CREATED / NOT USED`.
+
+## Publication ja muuttumattomuus
+
+- Code commit pushattiin forkille normaalisti ilman forcea.
+- Fork code SHA readback: `dcb83f318959191f2b3bc7492d7802f2dbcf7f93` — MATCH.
+- Origin säilyi `https://github.com/NousResearch/hermes-agent.git` eikä originia pushattu.
+- Fork säilyi `git@github.com:tikauppi/hermes-agent.git`.
+- Evidence commit muuttaa vain `implementation-results.md`- ja `validation-results.md`-tiedostoja; tämä varmennetaan staged scope-, remote scope- ja blob-hash-readbackissa.
+- Ei S123/S124-, schema/table/migration-, merge-, rebase-, force-push-, Gate 2- tai Reviewer R5 -dispatch-muutosta.
+
+Builderin tekninen validointi ei ole oma katselmus eikä Arkkitehdin hyväksyntä.
+
+R5 TECHNICALLY VALIDATED — PRODUCTION AUTHORITY BLOCKED — AWAITING INDEPENDENT REVIEWER R5

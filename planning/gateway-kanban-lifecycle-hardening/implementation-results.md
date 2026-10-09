@@ -181,3 +181,68 @@ Testattu SHA: `6bcaa640a5b0df3fedc309429ec494e628d10f65`.
 - Builder ei dispatchaa Reviewer R4:ää eikä myönnä Gate 2:ta.
 
 R4 CORRECTIONS COMPLETE OR PARTIALLY BLOCKED — AWAITING INDEPENDENT REVIEWER R4
+
+---
+
+# R5 limited corrective implementation — 2026-10-09
+
+Tila: `R5 TECHNICALLY VALIDATED — PRODUCTION AUTHORITY BLOCKED`
+
+Session: `@session:theseus-builder/20261009_051058_6d682d`
+
+- Base/evidence: `44a7c25d5709798bbae567e9743a004089dbda1f`.
+- R4 code: `6bcaa640a5b0df3fedc309429ec494e628d10f65`.
+- R5 code SHA: `dcb83f318959191f2b3bc7492d7802f2dbcf7f93`.
+- Fork code readback: `dcb83f318959191f2b3bc7492d7802f2dbcf7f93` — MATCH.
+- Evidence/docs SHA: tämän R5-osion ja päivitetyn `validation-results.md`:n sisältävä seuraava commit. Exact arvo varmennetaan non-force pushin jälkeisessä remote-readbackissa; commit ei voi sisältää omaa tulevaa SHA:taan.
+
+## R5-toteutusmatriisi
+
+| Kohta | Tila | Toteutus |
+|---|---|---|
+| R5-DEC-01 / R5-01 | IMPLEMENTED WITH SYNTHETIC TEST AUTHORITY; production BLOCKED | Common `_authority_gate_locked` varmentaa ja kuluttaa evidenssin varsinaisen SQLite-mutaatiotransaktion sisällä. Terminal approval, fresh approval, Architect resume ja Investigator authorization käyttävät samaa rajaa. Public production entrypointit, CLI ja Gatewayn yhteinen slash-polku hylkäävät myös validin synteettisen evidenssin tilalla `BLOCKED — TRUSTED AUTHORITY NOT CONFIGURED`. |
+| R5-02 | IMPLEMENTED / VALIDATED | Genuine JSON int, bool-hylkäys, safe range/order, `now < expires_at`, issuer/principal authorization, Ed25519-signature, type/action/scope/target-sidonnat, issuer/key/nonce-revokaatio, replay ja concurrency. |
+| R4-02 | PRESERVED | Restricted-role native/dispatcher claim -raja ja designated host -politiikka säilyvät. |
+| R4-03 | PRESERVED Linux/POSIX | Artifact identity, atomic publication, fsync/no-replace ja fail-closed unsupported-platform -raja säilyvät. |
+| R4-05 | PRESERVED Linux | pidfd birth-identity, manual fence ja retry prevention säilyvät. |
+| R3-06 | PRESERVED | Dry-run säilyy DB/artifact non-mutating -polkuna. |
+
+## Common authority mutation boundary
+
+`_authority_gate_locked` saa expected binding -kontekstin lifecycle-koodilta, ei caller-metadatasta. Verifier tarkistaa issuer/key-id trust-mapin, issuerin authorized principal/role -mäppäyksen, allekirjoituksen, päätöstyypin, actionin, scopen, package/task/run/STOP/code SHA -kohteen, ajan ja revokaation. Caller `actor`, ref, timestamp, metadata, env tai ContextVar ei anna auktoriteettia.
+
+Receipt `(issuer, nonce)` etsitään ja `theseus_authority_consumed` kirjoitetaan samassa `BEGIN IMMEDIATE` -transaktiossa lifecycle-tilasiirtymän ja päätösauditin kanssa. Replay, CAS-failure tai audit/transition-poikkeus rollbackaa receiptin ja tilan yhdessä. Uutta skeemaa tai taulua ei lisätty.
+
+Public `record_terminal_approval`, `issue_fresh_terminal_approval` ja `resume_after_architect_decision` ovat production-configuraation puuttuessa aina fail-closed. Public Investigator creation kulkee samaan blokkiin. Private test-only wrapperit sallivat disposable synteettisen verifierin harjoittaa todellista mutation boundarya; public API hylkää samankin synteettisen konfiguraation. Reviewer-taskin normaali read-only-luonti ei ole Architect approval -kirjoitus ja säilyy ennallaan.
+
+CLI korvaa caller-controlled `--approval-ref`/`--approved-at`-pinnan `--authority-evidence`-syötteellä, mutta production verifier/trust storea ei ole kytketty, joten CLI ja Gatewayn `/kanban`-delegointi pysyvät blokissa. Suora yleinen `_transition` ei voi siirtää approval-/resume-suojattua vaihetta `READY_FOR_BUILDER`-tilaan.
+
+## Strict verifier
+
+- Exact envelope- ja payload-kentät; JSON-duplikaattiavaimet hylätään.
+- `version`, `run_id`, `issued_at`, `expires_at`: `int` mutta ei `bool`, alue `0 <= x < 2^63`.
+- `version == 1`, `algorithm == Ed25519`, SHA-1-muotoinen 40-merkkinen lowercase code SHA nykyisen sopimuksen mukaisesti.
+- Aika: `issued_at <= now < expires_at` ja `issued_at < expires_at`.
+- Unknown issuer/key, unauthorized principal/role, revoked issuer/key/nonce, forged/malformed, wrong type/action/scope/package/task/run/STOP/SHA ja replay hylätään.
+
+## Authority contract
+
+- Polku: `planning/gateway-kanban-lifecycle-hardening/authority-contract.md`.
+- SHA-256: `00e4af41d4493155c82c5278bb48482e190905a21108e6bacd1531aacbb92b92`.
+- Sopimus erottaa eksplisiittisesti `IMPLEMENTED`, `TESTED WITH SYNTHETIC ISSUER` ja `BLOCKED — PRODUCTION AUTHORITY NOT AVAILABLE`.
+
+## Production blocker ja rajattu Architect-muutosesitys
+
+Tuotannon authenticated decision identity, hyväksytty issuer, principal/role authorization, signing-key management, trusted public-key distribution/trust store, authoritative revocation/receipt store, cross-board replay policy, rollout-monitorointi sekä incident/rollback-päätökset puuttuvat. Niitä ei keksitty tai aktivoitu R5:ssä.
+
+Täsmällinen production tila on:
+
+`BLOCKED — TRUSTED AUTHORITY NOT CONFIGURED`
+
+Jos cross-board atomic consumption vaatii uuden globaalin mallin, skeeman tai taulun, toteutus edellyttää erillistä Architect-lupaa. Authority contract sisältää rajatun muutosesityksen.
+
+## Scope
+
+Koodicommit muuttaa täsmälleen seitsemän polkua: neljä lifecycle/verifier/CLI Python-polkuja, authority contractin sekä kaksi testiä. Ei S123/S124-, schema/table/migration-, production issuer/key/trust-store-, desired-state-, profile-, live Gateway- tai production board -muutosta. Ei mergeä, rebasea, force-pushia, origin-pushia, Gate 2 -päätöstä tai Reviewer R5 -dispatchia.
+
+R5 TECHNICALLY VALIDATED — PRODUCTION AUTHORITY BLOCKED — AWAITING INDEPENDENT REVIEWER R5
