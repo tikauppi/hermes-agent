@@ -59,6 +59,26 @@ def _is_dispatcher_owned_worker() -> bool:
         return True
 
 
+_THESEUS_RESTRICTED_ROLE_TOOLS = frozenset({
+    "read_file", "search_files", "web_search", "web_extract", "vision_analyze",
+    "skills_list", "skill_view", "kanban_show", "kanban_complete",
+    "kanban_request_changes", "kanban_block", "kanban_heartbeat", "kanban_comment",
+    "kanban_attachments",
+})
+
+
+def _theseus_restricted_role() -> Optional[str]:
+    role = os.environ.get("HERMES_THESEUS_RESTRICTED_ROLE", "").strip()
+    if (
+        role in {"reviewer", "investigator"}
+        and os.environ.get("HERMES_KANBAN_TASK")
+        and not _is_delegated_child_context()
+        and _is_dispatcher_owned_worker()
+    ):
+        return role
+    return None
+
+
 # --- Async bridging (single source of truth; registry.dispatch uses it too) ---
 # Loops are persistent (never asyncio.run per call): cached httpx/AsyncOpenAI
 # clients stay bound to a live loop, so their GC cleanup can't hit "Event loop
@@ -272,7 +292,7 @@ def _tool_defs_cache_key(
     return (
         registry.current_scope_key(), frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
         frozenset(disabled_toolsets) if disabled_toolsets else None, registry._generation, cfg_fp,
-        bool(os.environ.get("HERMES_KANBAN_TASK")), bool(skip_tool_search_assembly),
+        bool(os.environ.get("HERMES_KANBAN_TASK")), _theseus_restricted_role(), bool(skip_tool_search_assembly),
         _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope,
     )
 
@@ -331,6 +351,8 @@ def _select_tool_names(enabled_toolsets: Optional[List[str]], disabled_toolsets:
     # disabled toolset are strictly stripped out. See issue #17309.
     if disabled_toolsets:
         _apply_toolset_selection(tools, disabled_toolsets, quiet_mode, disable=True)
+    if _theseus_restricted_role() is not None:
+        tools.intersection_update(_THESEUS_RESTRICTED_ROLE_TOOLS)
     return tools
 
 
@@ -821,6 +843,12 @@ def handle_function_call(
     function_name = _LEGACY_TOOL_ALIASES.get(function_name, function_name)
     ids = _CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id)
     start = time.monotonic()
+
+    role = _theseus_restricted_role()
+    if role is not None and function_name not in _THESEUS_RESTRICTED_ROLE_TOOLS:
+        return tool_error(
+            f"{function_name} is unavailable to read-only THESEUS {role} workers"
+        )
 
     def _emit(result: Any, **extra: Any) -> Any:
         """Emit post_tool_call with this call's identity fields; returns *result*."""

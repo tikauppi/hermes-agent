@@ -1513,7 +1513,9 @@ def dispatch_once(
         else:
             result = _locked_tick()
             # Still under the dispatch lock: periodic PASSIVE WAL checkpoint.
-            _kbc._maybe_checkpoint_wal(conn, db_path)
+            # A dry run is observation-only, including storage maintenance.
+            if not dry_run:
+                _kbc._maybe_checkpoint_wal(conn, db_path)
     # Lock released. Fire the tick observer strictly OUTSIDE the critical
     # section: a slow subscriber must never stall a sibling dispatcher's tick.
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
@@ -1605,7 +1607,8 @@ def _dispatch_lane_task(
         _count_spawn(assignee)
         return True
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
+    with _theseus_lifecycle._role_dispatch_claim_grant():
+        claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
     try:
@@ -1653,13 +1656,18 @@ def _dispatch_lane_task(
         if lifecycle_dispatch:
             if pid <= 0:
                 raise RuntimeError("lifecycle dispatch requires a positive worker PID")
-            bound = _set_worker_pid(
-                conn,
-                claimed.id,
-                pid,
-                expected_run_id=run_id,
-                expected_claim_lock=claim_lock,
-            )
+            try:
+                bound = _set_worker_pid(
+                    conn,
+                    claimed.id,
+                    pid,
+                    expected_run_id=run_id,
+                    expected_claim_lock=claim_lock,
+                )
+            except Exception:
+                if _is_verified_new_child(pid):
+                    _terminate_reclaimed_worker(pid, claim_lock)
+                raise
             if not bound:
                 if _is_verified_new_child(pid):
                     _terminate_reclaimed_worker(pid, claim_lock)
@@ -1858,10 +1866,14 @@ def _dispatch_once_locked(
     the PID so later ticks catch crashes before the TTL. Cap semantics:
     :func:`_tick_spawn_budget`."""
     result = DispatchResult()
-    _run_reclaim_phase(
-        conn, result, stale_timeout_seconds=stale_timeout_seconds,
-        failure_limit=failure_limit, reconcile_orphans=reconcile_orphans,
-    )
+    # Reclaim, orphan reconciliation, crash accounting, timeout enforcement,
+    # and ready promotion all persist state.  A dry run must inspect the board
+    # exactly as it is and remain repeatable, so it skips the whole phase.
+    if not dry_run:
+        _run_reclaim_phase(
+            conn, result, stale_timeout_seconds=stale_timeout_seconds,
+            failure_limit=failure_limit, reconcile_orphans=reconcile_orphans,
+        )
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
@@ -2336,6 +2348,13 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # kanban_comment reads HERMES_PROFILE for its default author; `-p` alone
     # doesn't set the env var.
     env["HERMES_PROFILE"] = profile_arg
+    from hermes_cli import kanban_theseus_lifecycle as _theseus_lifecycle
+
+    restricted_role = _theseus_lifecycle.restricted_role_for_worker(task)
+    if restricted_role is not None:
+        env["HERMES_THESEUS_RESTRICTED_ROLE"] = restricted_role
+    else:
+        env.pop("HERMES_THESEUS_RESTRICTED_ROLE", None)
     # This is the grant boundary: the dispatcher assigned this new worker's task.
     from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
     env.pop(DELEGATED_CHILD_ENV_MARKER, None)

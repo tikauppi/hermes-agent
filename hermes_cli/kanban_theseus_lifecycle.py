@@ -14,6 +14,8 @@ import re
 import stat
 import subprocess
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -46,6 +48,9 @@ ROLE_READY_PHASE = {
     "investigator": INVESTIGATION_RUNNING,
 }
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_ROLE_DISPATCH_CLAIM_GRANTED: ContextVar[bool] = ContextVar(
+    "theseus_role_dispatch_claim_granted", default=False
+)
 
 _ALLOWED_TRANSITIONS = {
     PLANNED: {AWAITING_TERMINAL_APPROVAL},
@@ -99,6 +104,26 @@ def _event_payload(conn, task_id: str, kind: str) -> Optional[dict]:
 
 def package_metadata(conn, task_id: str) -> Optional[dict]:
     return _event_payload(conn, task_id, "theseus_lifecycle_initialized")
+
+
+def _current_dispatcher_profile() -> str:
+    for name in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return str(get_active_profile_name() or "default")
+    except Exception:
+        return "default"
+
+
+def _dispatcher_host_allowed(metadata: dict) -> bool:
+    return (
+        metadata.get("dispatcher_profile") == DESIGNATED_DISPATCHER_PROFILE
+        and _current_dispatcher_profile() == DESIGNATED_DISPATCHER_PROFILE
+    )
 
 
 def _transition(
@@ -321,16 +346,68 @@ def _decision_for_claim(conn, task_id: str) -> Optional[dict]:
 
 def native_claim_allowed_locked(conn, task_id: str) -> bool:
     row = conn.execute(
-        "SELECT workflow_template_id, current_step_key FROM tasks WHERE id=?", (task_id,)
+        "SELECT workflow_template_id, current_step_key, assignee FROM tasks WHERE id=?", (task_id,)
     ).fetchone()
     if row is None or row["workflow_template_id"] != WORKFLOW_TEMPLATE_ID:
         return True
+    metadata = package_metadata(conn, task_id)
+    if metadata is None:
+        return False
+    if not _dispatcher_host_allowed(metadata):
+        return False
+    role = str(metadata.get("role") or "")
+    if row["assignee"] != ROLE_PROFILES.get(role):
+        return False
+    if role in {"reviewer", "investigator"}:
+        if not _ROLE_DISPATCH_CLAIM_GRANTED.get():
+            return False
+        if (
+            metadata.get("authority") != "read-only"
+            or metadata.get("publish_allowed") is not False
+            or metadata.get("merge_allowed") is not False
+        ):
+            return False
+        active_peer = conn.execute(
+            "SELECT 1 FROM tasks t JOIN task_events e ON e.task_id=t.id "
+            "WHERE e.kind='theseus_lifecycle_initialized' AND t.id!=? AND t.status='running' "
+            "AND json_extract(e.payload, '$.package_id')=? "
+            "AND json_extract(e.payload, '$.role') IN ('reviewer','investigator') LIMIT 1",
+            (task_id, metadata.get("package_id")),
+        ).fetchone()
+        if active_peer is not None:
+            return False
     phase = row["current_step_key"]
     if phase == READY_FOR_BUILDER:
         return _approval_for_claim(conn, task_id) is not None or _decision_for_claim(conn, task_id) is not None
     if phase == BUILDER_RUNNING:
         return _decision_for_claim(conn, task_id) is not None
     return phase in {REVIEW_RUNNING, INVESTIGATION_RUNNING}
+
+
+@contextmanager
+def _role_dispatch_claim_grant():
+    """Allow this dispatcher call stack to claim a restricted role task."""
+    token = _ROLE_DISPATCH_CLAIM_GRANTED.set(True)
+    try:
+        yield
+    finally:
+        _ROLE_DISPATCH_CLAIM_GRANTED.reset(token)
+
+
+def restricted_role_for_worker(task: Any) -> Optional[str]:
+    """Return the enforced read-only role for a validated lifecycle worker."""
+    if getattr(task, "workflow_template_id", None) != WORKFLOW_TEMPLATE_ID:
+        return None
+    phase = str(getattr(task, "current_step_key", None) or "")
+    role = {
+        REVIEW_RUNNING: "reviewer",
+        INVESTIGATION_RUNNING: "investigator",
+    }.get(phase)
+    if role is None:
+        return None
+    if getattr(task, "assignee", None) != ROLE_PROFILES[role]:
+        raise ValueError("lifecycle role/profile capability mismatch")
+    return role
 
 
 def bind_claim_authority_locked(conn, task_id: str, run_id: int) -> None:
@@ -705,6 +782,8 @@ def dispatch_preflight(conn, task_id: str) -> tuple[bool, Optional[str]]:
     metadata = package_metadata(conn, task_id)
     if metadata is None:
         return False, "lifecycle_metadata_missing"
+    if not _dispatcher_host_allowed(metadata):
+        return False, "dispatcher_host_mismatch"
     role = metadata.get("role")
     if task.assignee != ROLE_PROFILES.get(str(role)):
         return False, "role_profile_mismatch"
@@ -881,10 +960,18 @@ def _artifact_component(name: str, value: Any) -> str:
     return value
 
 
-def _open_secure_directory(path: Path) -> int:
-    """Open/create an absolute directory chain without following symlinks."""
+def _directory_identity(fd: int) -> list[int]:
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode):
+        raise ValueError("artifact directory component is not a directory")
+    return [int(st.st_dev), int(st.st_ino)]
+
+
+def _open_secure_directory(path: Path) -> tuple[int, list[list[int]]]:
+    """Open/create an absolute directory chain and capture every identity."""
     flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path.anchor, flags)
+    chain = [_directory_identity(fd)]
     try:
         for component in path.parts[1:]:
             created = False
@@ -898,8 +985,9 @@ def _open_secure_directory(path: Path) -> int:
                 os.fchmod(next_fd, 0o700)
             os.close(fd)
             fd = next_fd
+            chain.append(_directory_identity(fd))
         os.fchmod(fd, 0o700)
-        return fd
+        return fd, chain
     except BaseException:
         os.close(fd)
         raise
@@ -913,7 +1001,7 @@ def run_artifact_paths(root: Path, board: str, task_id: str, run_id: int) -> dic
     )
     root_path = Path(os.path.abspath(os.fspath(Path(root).expanduser())))
     try:
-        fd = _open_secure_directory(root_path)
+        fd, directory_chain = _open_secure_directory(root_path)
     except OSError as exc:
         raise ValueError("artifact root contains a symlink or unsafe component") from exc
     flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
@@ -929,6 +1017,7 @@ def run_artifact_paths(root: Path, board: str, task_id: str, run_id: int) -> dic
             os.close(fd)
             fd = next_fd
             current /= component
+            directory_chain.append(_directory_identity(fd))
         identities: dict[str, list[int]] = {}
         create_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
         for name in ("report", "result"):
@@ -952,6 +1041,7 @@ def run_artifact_paths(root: Path, board: str, task_id: str, run_id: int) -> dic
         "result": str(current / "result.md"),
         "manifest": str(current / "manifest.json"),
         "_identity": identities,
+        "_directory_identity": directory_chain,
     }
 
 
@@ -980,15 +1070,25 @@ def persist_run_artifact_paths(conn, task_id: str, run_id: int, *, board: str, r
 
 def finalize_artifacts(paths: dict[str, Any], *, manifest_facts: Optional[dict] = None) -> dict:
     directory = Path(paths["directory"])
-    if directory.is_symlink():
-        raise ValueError("artifact directory is a symlink")
     identities = paths.get("_identity")
     if not isinstance(identities, dict):
         raise ValueError("prepared artifact identity is missing")
-    directory_fd = os.open(
-        directory,
-        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
-    )
+    expected_chain = paths.get("_directory_identity")
+    if not isinstance(expected_chain, list) or len(expected_chain) != len(directory.parts):
+        raise ValueError("prepared artifact directory identity is missing")
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(directory.anchor, flags)
+    try:
+        for index, expected in enumerate(expected_chain):
+            if index:
+                next_fd = os.open(directory.parts[index], flags, dir_fd=directory_fd)
+                os.close(directory_fd)
+                directory_fd = next_fd
+            if not isinstance(expected, list) or _directory_identity(directory_fd) != expected:
+                raise ValueError("artifact directory chain was replaced after prepare")
+    except BaseException:
+        os.close(directory_fd)
+        raise
     files: dict[str, dict] = {}
     try:
         seen: set[tuple[int, int]] = set()
@@ -1026,18 +1126,30 @@ def finalize_artifacts(paths: dict[str, Any], *, manifest_facts: Optional[dict] 
                 "sha256": hashlib.sha256(data).hexdigest(),
             }
         manifest = {"artifacts": files, **(manifest_facts or {})}
-        manifest_fd = os.open(
-            "manifest.json",
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-            dir_fd=directory_fd,
-        )
+        manifest_created = False
         try:
-            payload = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
-            os.write(manifest_fd, payload)
-            os.fsync(manifest_fd)
-        finally:
-            os.close(manifest_fd)
+            manifest_fd = os.open(
+                "manifest.json",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=directory_fd,
+            )
+            manifest_created = True
+            try:
+                payload = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
+                offset = 0
+                while offset < len(payload):
+                    offset += os.write(manifest_fd, payload[offset:])
+                os.fsync(manifest_fd)
+            finally:
+                os.close(manifest_fd)
+        except BaseException:
+            if manifest_created:
+                try:
+                    os.unlink("manifest.json", dir_fd=directory_fd)
+                except FileNotFoundError:
+                    pass
+            raise
     except OSError as exc:
         raise ValueError("artifact manifest path is unsafe or already finalized") from exc
     finally:

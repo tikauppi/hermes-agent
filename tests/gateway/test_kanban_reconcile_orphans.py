@@ -157,8 +157,9 @@ class TestDispatchOnceReconciles:
         tid = kb.create_task(conn, title="zombie", assignee="w")
         _orphan_running(conn, tid)
 
-        result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: (True, ""),
-                                  dry_run=True)
+        result = kbd.dispatch_once(
+            conn, spawn_fn=lambda *a, **k: (True, ""), max_spawn=0
+        )
 
         assert tid in result.reconciled_orphans
         assert conn.execute(
@@ -171,8 +172,12 @@ class TestDispatchOnceReconciles:
         tid = kb.create_task(conn, title="zombie", assignee="w")
         _orphan_running(conn, tid)
 
-        result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: (True, ""),
-                                  dry_run=True, reconcile_orphans=False)
+        result = kbd.dispatch_once(
+            conn,
+            spawn_fn=lambda *a, **k: (True, ""),
+            max_spawn=0,
+            reconcile_orphans=False,
+        )
 
         assert result.reconciled_orphans == []
         assert conn.execute(

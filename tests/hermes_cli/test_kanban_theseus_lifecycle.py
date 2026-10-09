@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import model_tools
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
@@ -23,6 +24,7 @@ def lifecycle_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", glh.DESIGNATED_DISPATCHER_PROFILE)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(glh.time, "time", lambda: 110)
     monkeypatch.setattr(
@@ -624,6 +626,89 @@ def test_role_candidate_collision_and_nonconcurrency_are_enforced(lifecycle_db, 
     assert not [item for item in second.spawned if item[0] == investigator_id]
 
 
+def test_role_native_claim_rejects_wrong_capability_and_active_peer(lifecycle_db, monkeypatch):
+    conn, tmp_path = lifecycle_db
+    builder_id = _builder(conn, tmp_path)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (builder_id,))
+    reviewer_path = tmp_path / "reviewer-native-wt"
+    investigator_path = tmp_path / "investigator-native-wt"
+    reviewer_path.mkdir()
+    investigator_path.mkdir()
+    monkeypatch.setattr(
+        glh,
+        "_read_git_identity",
+        lambda path: {
+            "root": str(Path(path).resolve()),
+            "branch": (
+                "pilot/reviewer-native"
+                if Path(path).resolve() == reviewer_path.resolve()
+                else "pilot/investigator-native"
+            ),
+            "head": "b" * 40,
+            "parent": "a" * 40,
+        },
+    )
+    reviewer_id = glh.create_role_task(
+        conn,
+        builder_task_id=builder_id,
+        role="reviewer",
+        title="native review",
+        candidate_sha="b" * 40,
+        branch="pilot/reviewer-native",
+        worktree=str(reviewer_path),
+    )
+    investigator_id = glh.create_role_task(
+        conn,
+        builder_task_id=builder_id,
+        role="investigator",
+        title="native investigation",
+        candidate_sha="b" * 40,
+        branch="pilot/investigator-native",
+        worktree=str(investigator_path),
+        authorization_ref="architect:investigate",
+    )
+
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET assignee='theseus-builder' WHERE id=?", (reviewer_id,))
+    assert kb.claim_task(conn, reviewer_id) is None
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET assignee=? WHERE id=?", (glh.ROLE_PROFILES["reviewer"], reviewer_id))
+
+    assert kb.claim_task(conn, reviewer_id) is None
+    assert kb.list_runs(conn, reviewer_id) == []
+
+    reviewer_dispatch = kbd.dispatch_once(
+        conn, spawn_fn=lambda *_args, **_kwargs: 49801, max_spawn=1
+    )
+    assert [item[0] for item in reviewer_dispatch.spawned] == [reviewer_id]
+    assert kb.claim_task(conn, investigator_id) is None
+    assert kb.list_runs(conn, investigator_id) == []
+
+
+@pytest.mark.parametrize("role", ["reviewer", "investigator"])
+def test_role_worker_capabilities_are_enforced_at_schema_and_native_dispatch(monkeypatch, role):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t-role")
+    monkeypatch.setenv("HERMES_THESEUS_RESTRICTED_ROLE", role)
+    selected = model_tools._select_tool_names(["hermes-cli"], None, True)
+
+    assert {"read_file", "search_files", "kanban_show", "kanban_complete"} <= selected
+    assert not {
+        "terminal",
+        "process_manage",
+        "write_file",
+        "patch",
+        "execute_code",
+        "delegate_task",
+        "tool_call",
+        "skill_manage",
+        "memory",
+        "cronjob_manage",
+    } & selected
+    denied = json.loads(model_tools.handle_function_call("terminal", {"command": "git push"}))
+    assert "read-only" in denied["error"]
+
+
 def test_glh_08_run_artifacts_are_distinct_hashed_and_collision_guarded(lifecycle_db):
     _conn, tmp_path = lifecycle_db
     paths = glh.run_artifact_paths(tmp_path / "runs", "pilot", "task-1", 7)
@@ -671,6 +756,38 @@ def test_artifacts_reject_traversal_symlink_and_replacement(lifecycle_db):
     report.symlink_to(secret)
     with pytest.raises(ValueError, match="replaced|symlink"):
         glh.finalize_artifacts(paths)
+
+
+def test_artifacts_reject_prepare_finalize_ancestor_replacement_with_hardlinks(lifecycle_db):
+    _conn, tmp_path = lifecycle_db
+    root = tmp_path / "secure-runs"
+    paths = glh.run_artifact_paths(root, "board", "task-1", 3)
+    Path(paths["report"]).write_text("report", encoding="utf-8")
+    Path(paths["result"]).write_text("result", encoding="utf-8")
+
+    held = tmp_path / "held-runs"
+    root.rename(held)
+    replacement = root / "board" / "task-1" / "3"
+    replacement.mkdir(parents=True)
+    os.link(held / "board" / "task-1" / "3" / "report.md", replacement / "report.md")
+    os.link(held / "board" / "task-1" / "3" / "result.md", replacement / "result.md")
+
+    with pytest.raises(ValueError, match="directory.*replaced|identity"):
+        glh.finalize_artifacts(paths)
+    assert not (replacement / "manifest.json").exists()
+    assert not (held / "board" / "task-1" / "3" / "manifest.json").exists()
+
+
+def test_artifact_manifest_write_failure_removes_partial_file(lifecycle_db, monkeypatch):
+    _conn, tmp_path = lifecycle_db
+    paths = glh.run_artifact_paths(tmp_path / "secure-runs", "board", "task-1", 4)
+    Path(paths["report"]).write_text("report", encoding="utf-8")
+    Path(paths["result"]).write_text("result", encoding="utf-8")
+    monkeypatch.setattr(glh.os, "fsync", lambda _fd: (_ for _ in ()).throw(OSError("forced fsync")))
+
+    with pytest.raises(ValueError, match="manifest"):
+        glh.finalize_artifacts(paths)
+    assert not Path(paths["manifest"]).exists()
 
 
 def test_missing_pid_and_pid_bind_failure_are_not_reported_as_spawned(lifecycle_db, monkeypatch):
@@ -730,18 +847,102 @@ def test_pid_bind_failure_does_not_kill_unverified_process(lifecycle_db, monkeyp
     assert terminated == []
 
 
-def test_lifecycle_dry_run_is_byte_for_byte_non_mutating(lifecycle_db):
+def test_pid_bind_exception_terminates_verified_child_and_preserves_retry_integrity(
+    lifecycle_db, monkeypatch
+):
     conn, tmp_path = lifecycle_db
     task_id = _builder(conn, tmp_path)
+    glh.record_terminal_approval(
+        conn, task_id, approval_ref="terminal:pid-exception", approved_at=101
+    )
+    original_set_worker_pid = kbd._set_worker_pid
+    terminated = []
+
+    def forced_exception(*_args, **_kwargs):
+        raise RuntimeError("forced PID bind exception")
+
+    monkeypatch.setattr(kbd, "_set_worker_pid", forced_exception)
+    monkeypatch.setattr(kbd, "_is_verified_new_child", lambda pid: pid == 49003)
+    monkeypatch.setattr(
+        kbd,
+        "_terminate_reclaimed_worker",
+        lambda pid, claim_lock: terminated.append((pid, claim_lock)) or {"terminated": True},
+    )
+
+    failed = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 49003)
+
+    assert failed.spawned == []
+    assert terminated and terminated[0][0] == 49003
+    failed_task = kb.get_task(conn, task_id)
+    assert failed_task is not None and failed_task.worker_pid is None
+    assert not [run for run in kb.list_runs(conn, task_id) if run.ended_at is None]
+
+    monkeypatch.setattr(kbd, "_set_worker_pid", original_set_worker_pid)
     with kb.write_txn(conn):
-        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
-    before = "\n".join(conn.iterdump())
+        conn.execute(
+            "UPDATE tasks SET status='blocked', current_step_key=?, block_kind='approval' WHERE id=?",
+            (glh.AWAITING_TERMINAL_APPROVAL, task_id),
+        )
+    assert glh.issue_fresh_terminal_approval(
+        conn,
+        task_id,
+        approval_ref="terminal:pid-exception-retry",
+        approved_at=101,
+        approval_expires_at=200,
+    )
+    retry = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 49004)
+    assert [item[0] for item in retry.spawned] == [task_id]
+    assert kb.get_task(conn, task_id).worker_pid == 49004
+    assert len(kb.list_runs(conn, task_id)) == 2
 
-    result = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 99999, dry_run=True)
 
-    after = "\n".join(conn.iterdump())
-    assert result.spawned == []
-    assert before == after
+def test_lifecycle_dry_run_is_byte_for_byte_non_mutating(lifecycle_db):
+    conn, tmp_path = lifecycle_db
+    lifecycle_id = _builder(conn, tmp_path)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (lifecycle_id,))
+
+    stale_id = kb.create_task(conn, title="dry-run stale", assignee="builder")
+    promotable_id = kb.create_task(conn, title="dry-run promotable", assignee="builder")
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (stale_id,))
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (promotable_id,))
+    stale = kb.claim_task(conn, stale_id, ttl_seconds=1)
+    assert stale is not None
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET claim_expires=0, worker_pid=NULL WHERE id=?",
+            (stale_id,),
+        )
+
+    artifact_root = tmp_path / "home" / "artifacts"
+    artifact_root.mkdir()
+    marker = artifact_root / "existing.txt"
+    marker.write_text("unchanged\n", encoding="utf-8")
+
+    def snapshot():
+        db = "\n".join(conn.iterdump())
+        files = {
+            str(path.relative_to(artifact_root)): (path.stat().st_mode, path.read_bytes())
+            for path in artifact_root.rglob("*")
+            if path.is_file()
+        }
+        return db, files
+
+    before = snapshot()
+    first = kbd.dispatch_once(
+        conn, spawn_fn=lambda *_args, **_kwargs: 99999, dry_run=True
+    )
+    after_first = snapshot()
+    second = kbd.dispatch_once(
+        conn, spawn_fn=lambda *_args, **_kwargs: 99999, dry_run=True
+    )
+    after_second = snapshot()
+
+    assert before == after_first == after_second
+    assert first == second
+    assert kb.get_task(conn, stale_id).status == "running"
+    assert kb.get_task(conn, promotable_id).status == "todo"
 
 
 def test_glh_09_dispatcher_policy_validation_is_opt_in_and_non_mutating():
@@ -781,6 +982,39 @@ def test_gateway_boot_enforces_designated_lifecycle_host(monkeypatch, tmp_path):
     runner = GatewayKanbanWatchersMixin()
     assert runner._kanban_dispatcher_boot() is None
     assert getattr(runner, "_kanban_dispatcher_lock_handle", None) is None
+
+
+@pytest.mark.parametrize("profile", ["theseus-reviewer", ""])
+def test_all_dispatch_and_native_claim_routes_reject_non_designated_host(
+    lifecycle_db, monkeypatch, profile
+):
+    conn, tmp_path = lifecycle_db
+    task_id = _builder(conn, tmp_path)
+    assert glh.record_terminal_approval(
+        conn, task_id, approval_ref=f"terminal:host-{profile or 'missing'}", approved_at=101
+    )
+    if profile:
+        monkeypatch.setenv("HERMES_PROFILE", profile)
+    else:
+        monkeypatch.delenv("HERMES_PROFILE", raising=False)
+        monkeypatch.delenv("HERMES_PROFILE_NAME", raising=False)
+
+    dispatched = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 49901)
+    assert dispatched.spawned == []
+    assert kb.list_runs(conn, task_id) == []
+    assert kb.get_task(conn, task_id).status == "blocked"
+
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_step_key=?, block_kind=NULL WHERE id=?",
+            (glh.READY_FOR_BUILDER, task_id),
+        )
+    assert kb.claim_task(conn, task_id) is None
+    assert kb.list_runs(conn, task_id) == []
+
+    legacy_id = kb.create_task(conn, title="legacy wrong-host pass-through", assignee="worker")
+    legacy = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 49902)
+    assert [item[0] for item in legacy.spawned] == [legacy_id]
 
 
 def test_glh_10_stop_wins_over_late_heartbeat_and_recovery(lifecycle_db):
