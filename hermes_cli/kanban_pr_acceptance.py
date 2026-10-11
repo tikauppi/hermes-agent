@@ -11,13 +11,18 @@ import re
 import urllib.error
 import urllib.request
 from typing import Any, NamedTuple
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
 _API_BASE = "https://api.github.com"
 _MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 _MAX_PAGES = 20
+_GITHUB_RECEIPT_PATH = re.compile(
+    r"/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:"
+    r"actions/runs/[1-9][0-9]*(?:/job/[1-9][0-9]*)?"
+    r"|commit/[0-9a-fA-F]{40}/checks)"
+)
 
 
 class _TrustedAcceptanceBinding(NamedTuple):
@@ -123,6 +128,33 @@ def _next_link(link: str | None) -> str | None:
     return None
 
 
+def _sanitize_provider_url(value: Any) -> str | None:
+    """Return only canonical GitHub check/status links safe for receipts."""
+    if not isinstance(value, str) or not value or not value.isascii():
+        return None
+    if any(character.isspace() or ord(character) < 0x20 for character in value):
+        return None
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "github.com"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or "%" in parsed.netloc
+        or "%" in parsed.path
+        or "\\" in parsed.netloc
+        or "\\" in parsed.path
+        or not _GITHUB_RECEIPT_PATH.fullmatch(parsed.path)
+    ):
+        return None
+    return f"https://github.com{parsed.path}"
+
+
 def _api(endpoint: str, *, query: str | None = None, paginate: bool = False) -> Any:
     token = _token()
     url = f"{_API_BASE.rstrip('/')}/{endpoint.lstrip('/')}"
@@ -208,10 +240,15 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
                 outcome = check.get("conclusion") if is_run else check["state"]
                 classification = _classify(check, sha, outcome, is_run)
                 outcomes.append(classification)
-                receipt["checks"].append({"name": context, "id": check["id"],
-                    "url": check.get("html_url") or check.get("target_url"),
+                check_receipt = {"name": context, "id": check["id"],
                     "head_sha": check.get("head_sha", check.get("sha")),
-                    "classification": classification, "conclusion": outcome})
+                    "classification": classification, "conclusion": outcome}
+                safe_url = _sanitize_provider_url(
+                    check.get("html_url") if is_run else check.get("target_url")
+                )
+                if safe_url is not None:
+                    check_receipt["url"] = safe_url
+                receipt["checks"].append(check_receipt)
         # Re-read after all pages: old-head successes are never transferable.
         current = _api(f"repos/{repo}/pulls/{number}")
         provenance_ok = (

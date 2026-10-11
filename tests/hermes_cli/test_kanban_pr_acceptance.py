@@ -19,6 +19,8 @@ def github(tmp_path, monkeypatch):
         "head": "a" * 40,
         "reads": 0,
         "requests": [],
+        "source": "check_run",
+        "provider_url": "https://github.com/acme/repo/actions/runs/42",
         "required": [{"context": "required", "app": {"databaseId": 1}}],
     }
 
@@ -71,11 +73,11 @@ def github(tmp_path, monkeypatch):
                     "app": {"id": 1},
                     "status": "in_progress" if state["conclusion"] == "pending" else "completed",
                     "conclusion": state["conclusion"],
-                    "html_url": "https://github.com/acme/repo/actions/runs/42",
+                    "html_url": state["provider_url"],
                 }
                 if state.get("stale"):
                     run["head_sha"] = "b" * 40
-                runs = [] if state.get("missing") else [run]
+                runs = [] if state.get("missing") or state["source"] == "legacy" else [run]
                 page = int(parse_qs(parsed.query).get("page", ["1"])[0])
                 if page == 1:
                     optional = [{**run, "id": 1000 + i, "name": "optional", "conclusion": "skipped"}
@@ -92,7 +94,13 @@ def github(tmp_path, monkeypatch):
                 if state.get("head_change"):
                     state["head"] = "b" * 40
             elif "/statuses" in parsed.path:
-                value = []
+                value = [] if state["source"] == "check_run" else [{
+                    "id": 43,
+                    "context": "required",
+                    "sha": sha,
+                    "state": state["conclusion"],
+                    "target_url": state["provider_url"],
+                }]
             elif "/pulls/" in parsed.path:
                 value = {
                     "number": 7,
@@ -176,6 +184,108 @@ def test_malformed_http_protocol_is_redacted_infra_receipt(monkeypatch, error_ty
     assert receipt["ok"] is False
     assert receipt["classification"] == "infra"
     assert "synthetic" not in json.dumps(receipt)
+
+
+_SAFE_PROVIDER_URL = "https://github.com/acme/repo/actions/runs/42"
+_PROVIDER_URL_CASES = (
+    ("query", f"{_SAFE_PROVIDER_URL}?access_token=CANARY_QUERY", _SAFE_PROVIDER_URL),
+    ("fragment", f"{_SAFE_PROVIDER_URL}#CANARY_FRAGMENT", _SAFE_PROVIDER_URL),
+    ("query-fragment", f"{_SAFE_PROVIDER_URL}?key=CANARY_QUERY#CANARY_FRAGMENT", _SAFE_PROVIDER_URL),
+    ("explicit-https-port", f"https://github.com:443/acme/repo/actions/runs/42?CANARY_PORT", _SAFE_PROVIDER_URL),
+    ("wrong-host", "https://ci.invalid/acme/repo/actions/runs/42?CANARY_WRONG_HOST", None),
+    ("userinfo-spoof", "https://github.com@ci.invalid/acme/repo/actions/runs/42?CANARY_USERINFO", None),
+    ("embedded-credential", "https://CANARY_CREDENTIAL@github.com/acme/repo/actions/runs/42", None),
+    ("unsupported-scheme", "http://github.com/acme/repo/actions/runs/42?CANARY_SCHEME", None),
+    ("malformed", "https://[github.com/CANARY_MALFORMED", None),
+    ("missing", None, None),
+    ("encoded-authority", "https://github.com%40ci.invalid/acme/repo/actions/runs/42?CANARY_AUTHORITY", None),
+    ("encoded-path", "https://github.com/acme/repo/actions/%72uns/42?CANARY_ENCODING", None),
+    ("unsafe-port", "https://github.com:444/acme/repo/actions/runs/42?CANARY_UNSAFE_PORT", None),
+)
+
+
+def _configure_provider_url_case(github, source, provider_url):
+    github.update(
+        conclusion="success",
+        head="a" * 40,
+        source=source,
+        provider_url=provider_url,
+        required=[{"context": "required", "app": {"databaseId": 1 if source == "check_run" else None}}],
+    )
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("source", ("check_run", "legacy"))
+@pytest.mark.parametrize(("case", "provider_url", "expected_url"), _PROVIDER_URL_CASES)
+def test_provider_urls_are_sanitized_in_returned_receipt(
+    github, caplog, source, case, provider_url, expected_url
+):
+    _configure_provider_url_case(github, source, provider_url)
+
+    receipt = acceptance.collect_acceptance(
+        "acme/repo", "https://github.com/acme/repo/pull/7"
+    )
+
+    assert receipt["ok"] is True, case
+    check = next(item for item in receipt["checks"] if item["name"] == "required")
+    if expected_url is None:
+        assert "url" not in check
+    else:
+        assert check["url"] == expected_url
+    assert "CANARY_" not in json.dumps(receipt)
+    assert "CANARY_" not in caplog.text
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("source", ("check_run", "legacy"))
+@pytest.mark.parametrize(("case", "provider_url", "expected_url"), _PROVIDER_URL_CASES)
+def test_provider_urls_are_sanitized_in_sqlite_acceptance_event(
+    github, caplog, source, case, provider_url, expected_url
+):
+    _configure_provider_url_case(github, source, provider_url)
+
+    with connect() as conn:
+        tid = kb.create_task(conn, title=f"url-{source}-{case}", completion_contract="acme/repo")
+        assert kb.complete_task(
+            conn, tid, metadata={"published_pr": "https://github.com/acme/repo/pull/7"}
+        )
+        assert kb.get_task(conn, tid).status == "done"
+        rows = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id", (tid,)
+        ).fetchall()
+
+    receipt = next(json.loads(payload) for kind, payload in rows if kind == "pr_acceptance")
+    check = next(item for item in receipt["checks"] if item["name"] == "required")
+    if expected_url is None:
+        assert "url" not in check
+    else:
+        assert check["url"] == expected_url
+    serialized_events = json.dumps([(kind, json.loads(payload)) for kind, payload in rows])
+    assert "CANARY_" not in serialized_events
+    assert "CANARY_" not in caplog.text
+
+
+@pytest.mark.linux_only
+def test_failed_preflight_persists_no_completion_or_unsafe_event(github, monkeypatch, caplog):
+    canary = "CANARY_FAILED_PREFLIGHT"
+
+    def malformed_response(*unused_args, **unused_kwargs):
+        raise http.client.BadStatusLine(canary)
+
+    monkeypatch.setattr(acceptance.urllib.request, "urlopen", malformed_response)
+    with connect() as conn:
+        tid = kb.create_task(conn, title="failed-preflight", completion_contract="acme/repo")
+        assert not kb.complete_task(
+            conn, tid, metadata={"published_pr": "https://github.com/acme/repo/pull/7"}
+        )
+        assert kb.get_task(conn, tid).status != "done"
+        rows = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id", (tid,)
+        ).fetchall()
+
+    assert all(kind != "completed" for kind, _ in rows)
+    assert canary not in json.dumps([(kind, json.loads(payload)) for kind, payload in rows])
+    assert canary not in caplog.text
 
 
 @pytest.mark.parametrize(
