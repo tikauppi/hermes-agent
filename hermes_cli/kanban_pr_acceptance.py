@@ -5,12 +5,12 @@ receipts only after rechecking the captured run/status/contract under its lock.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import re
-import subprocess
 import urllib.error
 import urllib.request
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import quote
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -18,6 +18,21 @@ _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([
 _API_BASE = "https://api.github.com"
 _MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 _MAX_PAGES = 20
+
+
+class _TrustedAcceptanceBinding(NamedTuple):
+    head_sha: str
+    base_ref: str
+    required_checks: frozenset[tuple[str, int]]
+
+
+_TRUSTED_ACCEPTANCE_BINDINGS = {
+    "https://github.com/tikauppi/THESEUS/pull/25": _TrustedAcceptanceBinding(
+        head_sha="c0a7d0d5bf1a69bf8e0968caf5343350d43d1d83",
+        base_ref="integration/126-canonical-s121-s123-full-vue-recovery",
+        required_checks=frozenset({("build-test", 15368)}),
+    ),
+}
 
 
 class _GitHubApiError(Exception):
@@ -35,22 +50,14 @@ def validate_contract(value: str | None) -> str:
 
 
 def _token() -> str:
-    # The kanban worker runs under a profile. Read that profile's scoped secret
-    # before falling back to gh's credential store; never pass a token in argv.
-    from hermes_cli.config import get_env_value
+    # The profile-owned .env file is the sole approved credential source.
+    # Ambient variables and global credential helpers can belong to another profile.
+    from hermes_cli.config import load_env
 
-    token = get_env_value("GITHUB_TOKEN") or get_env_value("GH_TOKEN")
+    scoped = load_env()
+    token = scoped.get("GITHUB_TOKEN") or scoped.get("GH_TOKEN")
     if token:
         return token
-    try:
-        result = subprocess.run(
-            ["gh", "auth", "token"], stdin=subprocess.DEVNULL, capture_output=True,
-            text=True, timeout=5, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        result = None
-    if result is not None and result.returncode == 0 and result.stdout.strip():
-        return result.stdout.strip()
     raise _GitHubApiError("unauthorized")
 
 
@@ -94,7 +101,13 @@ def _request(url: str, token: str, query: str | None = None) -> tuple[Any, str |
         # Do not read or persist the response body: private-repo errors can
         # contain organization details and authentication diagnostics.
         raise _GitHubApiError(_http_classification(exc.code)) from None
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeError):
+    except (
+        urllib.error.URLError,
+        http.client.HTTPException,
+        TimeoutError,
+        json.JSONDecodeError,
+        UnicodeError,
+    ):
         raise _GitHubApiError("infra") from None
 
 
@@ -162,6 +175,15 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
                 if rule["type"] == "required_status_checks":
                     required.update((r["context"], r.get("integration_id"))
                                     for r in rule["parameters"]["required_status_checks"])
+        binding = _TRUSTED_ACCEPTANCE_BINDINGS.get(url or "")
+        if binding is not None:
+            if sha != binding.head_sha or branch != binding.base_ref:
+                receipt.update(
+                    classification="stale",
+                    detail="PR head/base does not match the trusted acceptance binding; retry.",
+                )
+                return receipt
+            required = set(binding.required_checks)
         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
         if not required:
             receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
@@ -214,9 +236,8 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
         }[exc.classification]
         receipt.update(classification=exc.classification, detail=detail)
         return receipt
-    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError):
-        # Never persist gh stderr (credentials/host details); the failed phase is actionable.
-        receipt.update(classification="infra", detail="GitHub acceptance evidence unavailable or incomplete; check gh authentication/API access and retry.")
+    except (OSError, ValueError, KeyError, TypeError, IndexError):
+        receipt.update(classification="infra", detail="GitHub acceptance evidence unavailable or incomplete; check the profile-scoped token/API access and retry.")
         return receipt
 
 

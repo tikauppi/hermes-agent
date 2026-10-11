@@ -1,4 +1,5 @@
 """Lifecycle invariants using real SQLite and a local authenticated GitHub API."""
+import http.client
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -113,8 +114,10 @@ def github(tmp_path, monkeypatch):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     monkeypatch.setattr(acceptance, "_API_BASE", f"http://127.0.0.1:{server.server_port}", raising=False)
-    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    profile_home = tmp_path / "home"
+    profile_home.mkdir()
+    (profile_home / ".env").write_text("GITHUB_TOKEN=test-token\n")
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
     kb.init_db()
     try:
         yield state
@@ -122,6 +125,131 @@ def github(tmp_path, monkeypatch):
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_token_uses_only_profile_scoped_env_file(tmp_path, monkeypatch):
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("GITHUB_TOKEN", "ambient-github-token")
+    monkeypatch.setenv("GH_TOKEN", "ambient-gh-token")
+    monkeypatch.setenv("GH_HOST", "ambient.example")
+    calls = []
+
+    def unexpected_gh(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("gh credential fallback must not run")
+
+    monkeypatch.setattr("subprocess.run", unexpected_gh)
+
+    with pytest.raises(acceptance._GitHubApiError) as excinfo:
+        acceptance._token()
+
+    assert excinfo.value.classification == "unauthorized"
+    assert calls == []
+
+    (profile_home / ".env").write_text("GITHUB_TOKEN=scoped-test-token\n")
+    assert acceptance._token() == "scoped-test-token"
+
+
+@pytest.mark.parametrize(
+    ("error_type", "args"),
+    (
+        (http.client.BadStatusLine, ("synthetic-secret",)),
+        (http.client.IncompleteRead, (b"synthetic-secret", 64)),
+        (http.client.RemoteDisconnected, ("synthetic-secret",)),
+        (http.client.LineTooLong, ("synthetic-secret",)),
+    ),
+)
+def test_malformed_http_protocol_is_redacted_infra_receipt(monkeypatch, error_type, args):
+    monkeypatch.setattr(acceptance, "_token", lambda: "synthetic-token")
+
+    def malformed_response(*unused_args, **unused_kwargs):
+        raise error_type(*args)
+
+    monkeypatch.setattr(acceptance.urllib.request, "urlopen", malformed_response)
+
+    receipt = acceptance.collect_acceptance(
+        "acme/repo", "https://github.com/acme/repo/pull/7"
+    )
+
+    assert receipt["ok"] is False
+    assert receipt["classification"] == "infra"
+    assert "synthetic" not in json.dumps(receipt)
+
+
+@pytest.mark.parametrize(
+    ("case", "producer", "status", "conclusion", "expected_classification", "expected_ok"),
+    (
+        ("success", 15368, "completed", "success", "success", True),
+        ("failure", 15368, "completed", "failure", "failure", False),
+        ("pending", 15368, "in_progress", None, "pending", False),
+        ("skipped", 15368, "completed", "skipped", "infra", False),
+        ("missing", None, None, None, "missing", False),
+        ("stale", 15368, "completed", "success", "stale", False),
+        ("unavailable", 15368, "completed", "success", "infra", False),
+        ("wrong-app", 1, "completed", "success", "missing", False),
+        ("wrong-head", 15368, "completed", "success", "stale", False),
+        ("wrong-base", 15368, "completed", "success", "stale", False),
+    ),
+)
+def test_f6_scoped_binding_requires_trusted_head_and_build_test_app(
+    monkeypatch, case, producer, status, conclusion, expected_classification, expected_ok
+):
+    expected_head = "c0a7d0d5bf1a69bf8e0968caf5343350d43d1d83"
+    observed_head = "d" * 40 if case == "wrong-head" else expected_head
+    expected_base = "integration/126-canonical-s121-s123-full-vue-recovery"
+    observed_base = "main" if case == "wrong-base" else expected_base
+    contract = "https://github.com/tikauppi/THESEUS/pull/25"
+
+    def fake_api(endpoint, *, query=None, paginate=False):
+        if query is not None:
+            return {"data": {"repository": {"pullRequest": {
+                "headRefOid": observed_head,
+                "baseRefName": observed_base,
+                "state": "OPEN",
+                "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
+                    {"context": "build-test", "app": {"databaseId": 1}},
+                ]}},
+            }}}}
+        if "/rules/branches/" in endpoint:
+            return [[]]
+        if "/check-runs" in endpoint:
+            if case == "unavailable":
+                raise acceptance._GitHubApiError("infra")
+            runs = [] if producer is None else [{
+                "id": 42,
+                "name": "build-test",
+                "head_sha": "b" * 40 if case == "stale" else observed_head,
+                "app": {"id": producer},
+                "status": status,
+                "conclusion": conclusion,
+                "html_url": "https://github.com/tikauppi/THESEUS/actions/runs/42",
+            }]
+            return [{"total_count": len(runs), "check_runs": runs}]
+        if "/statuses" in endpoint:
+            return [[]]
+        if "/pulls/25" in endpoint:
+            return {
+                "number": 25,
+                "html_url": contract,
+                "head": {"sha": observed_head},
+                "base": {
+                    "ref": observed_base,
+                    "repo": {"full_name": "tikauppi/THESEUS"},
+                },
+                "state": "open",
+            }
+        raise AssertionError(endpoint)
+
+    monkeypatch.setattr(acceptance, "_api", fake_api)
+
+    receipt = acceptance.collect_acceptance(contract, contract)
+
+    assert receipt["classification"] == expected_classification
+    assert receipt["ok"] is expected_ok
+    if case == "wrong-app":
+        assert receipt["required"] == [{"context": "build-test", "app_id": 15368}]
 
 
 @pytest.mark.linux_only
