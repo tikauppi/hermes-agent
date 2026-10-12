@@ -189,37 +189,46 @@ def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _is_positive_int(value: Any) -> bool:
+    return _is_int(value) and value > 0
+
+
+def _is_sha(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{40}", value) is not None
+
+
+def _is_check_name(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip()) and all(0x20 <= ord(c) != 0x7F for c in value)
+
+
+def _is_branch_name(value: Any) -> bool:
+    return (
+        isinstance(value, str) and bool(value) and not value.startswith(("/", "."))
+        and not value.endswith(("/", ".", ".lock")) and ".." not in value and "@{" not in value
+        and "//" not in value and not any(c.isspace() or c in "~^:?*[\\" or ord(c) < 0x20 for c in value)
+    )
+
+
 def _graphql_pr(payload: Any) -> dict:
-    if not isinstance(payload, dict):
-        _schema_error()
-    data = payload.get("data")
+    data = payload.get("data") if isinstance(payload, dict) else None
     repository = data.get("repository") if isinstance(data, dict) else None
     pr = repository.get("pullRequest") if isinstance(repository, dict) else None
-    if not isinstance(pr, dict):
-        _schema_error()
-    if not all(isinstance(pr.get(key), str) for key in ("headRefOid", "baseRefName", "state")):
+    if not isinstance(pr, dict) or not _is_sha(pr.get("headRefOid")) or not _is_branch_name(pr.get("baseRefName")) or pr.get("state") not in {"OPEN", "CLOSED", "MERGED"}:
         _schema_error()
     base_ref = pr.get("baseRef")
     if base_ref is not None:
-        if not isinstance(base_ref, dict):
+        protection = base_ref.get("branchProtectionRule") if isinstance(base_ref, dict) else None
+        if not isinstance(base_ref, dict) or (protection is not None and not isinstance(protection, dict)):
             _schema_error()
-        protection = base_ref.get("branchProtectionRule")
         if protection is not None:
-            if not isinstance(protection, dict):
-                _schema_error()
             checks = protection.get("requiredStatusChecks")
             if not isinstance(checks, list):
                 _schema_error()
             for check in checks:
-                if not isinstance(check, dict) or not isinstance(check.get("context"), str):
+                app = check.get("app") if isinstance(check, dict) else None
+                database_id = app.get("databaseId") if isinstance(app, dict) else None
+                if not isinstance(check, dict) or not _is_check_name(check.get("context")) or (app is not None and (not isinstance(app, dict) or (database_id is not None and not _is_positive_int(database_id)))):
                     _schema_error()
-                app = check.get("app")
-                if app is not None:
-                    if not isinstance(app, dict):
-                        _schema_error()
-                    database_id = app.get("databaseId")
-                    if database_id is not None and not _is_int(database_id):
-                        _schema_error()
     return pr
 
 
@@ -230,45 +239,31 @@ def _rules_pages(payload: Any) -> list[list[dict]]:
         if not isinstance(page, list):
             _schema_error()
         for rule in page:
-            if not isinstance(rule, dict) or not isinstance(rule.get("type"), str):
+            if not isinstance(rule, dict) or not _is_check_name(rule.get("type")):
                 _schema_error()
-            if rule["type"] != "required_status_checks":
-                continue
-            parameters = rule.get("parameters")
-            checks = parameters.get("required_status_checks") if isinstance(parameters, dict) else None
-            if not isinstance(checks, list):
-                _schema_error()
-            for check in checks:
-                if not isinstance(check, dict) or not isinstance(check.get("context"), str):
+            if rule["type"] == "required_status_checks":
+                parameters = rule.get("parameters")
+                checks = parameters.get("required_status_checks") if isinstance(parameters, dict) else None
+                if not isinstance(checks, list):
                     _schema_error()
-                integration_id = check.get("integration_id")
-                if integration_id is not None and not _is_int(integration_id):
-                    _schema_error()
+                for check in checks:
+                    integration_id = check.get("integration_id") if isinstance(check, dict) else None
+                    if not isinstance(check, dict) or not _is_check_name(check.get("context")) or (integration_id is not None and not _is_positive_int(integration_id)):
+                        _schema_error()
     return payload
 
 
 def _check_run_pages(payload: Any) -> list[dict]:
     if not isinstance(payload, list) or not payload:
         _schema_error()
+    statuses = {"queued", "in_progress", "completed", "waiting", "requested", "pending"}
+    conclusions = {"action_required", "cancelled", "failure", "neutral", "success", "skipped", "stale", "timed_out"}
     for page in payload:
-        if not isinstance(page, dict) or not _is_int(page.get("total_count")):
+        if not isinstance(page, dict) or not _is_int(page.get("total_count")) or page["total_count"] < 0 or not isinstance(page.get("check_runs"), list):
             _schema_error()
-        runs = page.get("check_runs")
-        if not isinstance(runs, list):
-            _schema_error()
-        for run in runs:
-            if not isinstance(run, dict):
-                _schema_error()
-            app = run.get("app")
-            if (
-                not _is_int(run.get("id"))
-                or not isinstance(run.get("name"), str)
-                or not isinstance(run.get("head_sha"), str)
-                or not isinstance(app, dict)
-                or not _is_int(app.get("id"))
-                or not isinstance(run.get("status"), str)
-                or (run.get("conclusion") is not None and not isinstance(run.get("conclusion"), str))
-            ):
+        for run in page["check_runs"]:
+            app = run.get("app") if isinstance(run, dict) else None
+            if not isinstance(run, dict) or not _is_positive_int(run.get("id")) or not _is_check_name(run.get("name")) or not _is_sha(run.get("head_sha")) or not isinstance(app, dict) or not _is_positive_int(app.get("id")) or run.get("status") not in statuses or (run.get("conclusion") is not None and run.get("conclusion") not in conclusions) or (run.get("status") == "completed" and run.get("conclusion") is None):
                 _schema_error()
     return payload
 
@@ -280,34 +275,16 @@ def _status_pages(payload: Any) -> list[list[dict]]:
         if not isinstance(page, list):
             _schema_error()
         for status in page:
-            if (
-                not isinstance(status, dict)
-                or not _is_int(status.get("id"))
-                or not isinstance(status.get("context"), str)
-                or not isinstance(status.get("sha"), str)
-                or not isinstance(status.get("state"), str)
-            ):
+            if not isinstance(status, dict) or not _is_positive_int(status.get("id")) or not _is_check_name(status.get("context")) or not _is_sha(status.get("sha")) or status.get("state") not in {"error", "failure", "pending", "success"}:
                 _schema_error()
     return payload
 
 
 def _current_pr(payload: Any) -> dict:
-    if not isinstance(payload, dict):
-        _schema_error()
-    head = payload.get("head")
-    base = payload.get("base")
+    head = payload.get("head") if isinstance(payload, dict) else None
+    base = payload.get("base") if isinstance(payload, dict) else None
     repository = base.get("repo") if isinstance(base, dict) else None
-    if (
-        not _is_int(payload.get("number"))
-        or not isinstance(payload.get("html_url"), str)
-        or payload.get("state") not in {"open", "closed"}
-        or not isinstance(head, dict)
-        or not isinstance(head.get("sha"), str)
-        or not isinstance(base, dict)
-        or not isinstance(base.get("ref"), str)
-        or not isinstance(repository, dict)
-        or not isinstance(repository.get("full_name"), str)
-    ):
+    if not isinstance(payload, dict) or not _is_positive_int(payload.get("number")) or not isinstance(payload.get("html_url"), str) or payload.get("state") not in {"open", "closed"} or not isinstance(head, dict) or not _is_sha(head.get("sha")) or not isinstance(base, dict) or not _is_branch_name(base.get("ref")) or not isinstance(repository, dict) or _REPO.fullmatch(repository.get("full_name") or "") is None:
         _schema_error()
     if payload["state"] == "closed" and not isinstance(payload.get("merged"), bool):
         _schema_error()
@@ -335,7 +312,7 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
         pr = _graphql_pr(_api("graphql", query=query))
         sha, branch = pr["headRefOid"], pr["baseRefName"]
         receipt["head_sha"] = sha
-        if not re.fullmatch(r"[0-9a-f]{40}", sha) or pr["state"] not in {"OPEN", "MERGED"}:
+        if not _is_sha(sha) or pr["state"] not in {"OPEN", "MERGED"}:
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required: set[tuple[str, int | None]] = {
@@ -372,7 +349,7 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
         status_pages = _status_pages(
             _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100", paginate=True)
         )
-        statuses = [{**s, "sha": sha} for page in status_pages for s in page]
+        statuses = [status for page in status_pages for status in page]
         outcomes = []
         for context, app_id in sorted(required, key=str):
             matching = [r for r in runs if r["name"] == context and

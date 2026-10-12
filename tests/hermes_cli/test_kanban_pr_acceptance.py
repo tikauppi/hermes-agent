@@ -73,8 +73,8 @@ def github(tmp_path, monkeypatch):
                     "name": "required",
                     "head_sha": sha,
                     "app": {"id": 1},
-                    "status": "in_progress" if state["conclusion"] == "pending" else "completed",
-                    "conclusion": state["conclusion"],
+                    "status": "in_progress" if state["conclusion"] in {"pending", None} else "completed",
+                    "conclusion": None if state["conclusion"] == "pending" else state["conclusion"],
                     "html_url": state["provider_url"],
                 }
                 if state.get("stale"):
@@ -762,3 +762,163 @@ def test_acceptance_receipts_and_terminal_write_share_run_ownership(github):
                 "SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)
             ).fetchone()[0] == 0
             github.pop("race")
+
+
+def _semantic_payloads(case):
+    payloads = _acceptance_payloads()
+    graphql_pr = payloads["graphql"]["data"]["repository"]["pullRequest"]
+    run = payloads["checks"][0]["check_runs"][0]
+    if case == "legacy-wrong-head":
+        graphql_pr["baseRef"]["branchProtectionRule"]["requiredStatusChecks"] = [
+            {"context": "required", "app": None},
+        ]
+        payloads["checks"] = [{"total_count": 0, "check_runs": []}]
+        payloads["statuses"] = [[{
+            "id": 43,
+            "context": "required",
+            "sha": "b" * 40,
+            "state": "success",
+        }]]
+    elif case == "legacy-malformed-head":
+        graphql_pr["baseRef"]["branchProtectionRule"]["requiredStatusChecks"] = [
+            {"context": "required", "app": None},
+        ]
+        payloads["checks"] = [{"total_count": 0, "check_runs": []}]
+        payloads["statuses"] = [[{
+            "id": 43,
+            "context": "required",
+            "sha": "CANARY_UNTRUSTED_SHA",
+            "state": "success",
+        }]]
+    elif case == "legacy-unknown-state":
+        graphql_pr["baseRef"]["branchProtectionRule"]["requiredStatusChecks"] = [
+            {"context": "required", "app": None},
+        ]
+        payloads["checks"] = [{"total_count": 0, "check_runs": []}]
+        payloads["statuses"] = [[{
+            "id": 43,
+            "context": "required",
+            "sha": "a" * 40,
+            "state": "CANARY_UNTRUSTED_STATE",
+        }]]
+    elif case == "empty-required-name":
+        graphql_pr["baseRef"]["branchProtectionRule"]["requiredStatusChecks"][0]["context"] = ""
+        run["name"] = ""
+    elif case == "invalid-rule-context":
+        payloads["rules"] = [[{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [{
+                "context": "\x1f",
+                "integration_id": None,
+            }]},
+        }]]
+    elif case == "empty-base-ref":
+        graphql_pr["baseRefName"] = ""
+        payloads["current"]["base"]["ref"] = ""
+    elif case == "invalid-check-head":
+        run["head_sha"] = "CANARY_UNTRUSTED_SHA"
+    elif case == "unknown-check-status":
+        run["status"] = "CANARY_UNTRUSTED_STATUS"
+    elif case == "unknown-check-conclusion":
+        run["conclusion"] = "CANARY_UNTRUSTED_CONCLUSION"
+    elif case == "completed-without-conclusion":
+        run["conclusion"] = None
+    elif case == "zero-check-id":
+        run["id"] = 0
+    elif case == "negative-check-id":
+        run["id"] = -1
+    elif case == "string-check-id":
+        run["id"] = "42"
+    elif case == "bool-check-id":
+        run["id"] = True
+    elif case == "zero-app-id":
+        run["app"]["id"] = 0
+    elif case == "malformed-graphql-head":
+        graphql_pr["headRefOid"] = "CANARY_UNTRUSTED_SHA"
+    else:
+        raise AssertionError(case)
+    return payloads
+
+
+_SEMANTIC_INVALID_CASES = (
+    ("legacy-wrong-head", "stale"),
+    ("legacy-malformed-head", "infra"),
+    ("legacy-unknown-state", "infra"),
+    ("empty-required-name", "infra"),
+    ("invalid-rule-context", "infra"),
+    ("empty-base-ref", "infra"),
+    ("invalid-check-head", "infra"),
+    ("unknown-check-status", "infra"),
+    ("unknown-check-conclusion", "infra"),
+    ("completed-without-conclusion", "infra"),
+    ("zero-check-id", "infra"),
+    ("negative-check-id", "infra"),
+    ("string-check-id", "infra"),
+    ("bool-check-id", "infra"),
+    ("zero-app-id", "infra"),
+    ("malformed-graphql-head", "infra"),
+)
+
+
+@pytest.mark.parametrize(("case", "classification"), _SEMANTIC_INVALID_CASES)
+def test_semantic_evidence_rejections_are_redacted_before_policy_evaluation(
+    monkeypatch, caplog, case, classification
+):
+    monkeypatch.setattr(acceptance, "_api", _payload_api(_semantic_payloads(case)))
+
+    receipt = acceptance.collect_acceptance(
+        "acme/repo", "https://github.com/acme/repo/pull/7"
+    )
+
+    assert receipt["ok"] is False
+    assert receipt["classification"] == classification
+    assert "CANARY_UNTRUSTED" not in json.dumps(receipt)
+    assert "CANARY_UNTRUSTED" not in caplog.text
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize(("case", "classification"), _SEMANTIC_INVALID_CASES)
+def test_semantic_evidence_rejections_cannot_complete_disposable_task(
+    monkeypatch, caplog, case, classification
+):
+    contract = "https://github.com/acme/repo/pull/7"
+    monkeypatch.setattr(acceptance, "_api", _payload_api(_semantic_payloads(case)))
+
+    with connect() as conn:
+        task_id = kb.create_task(conn, title=f"semantic-{case}", completion_contract=contract)
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        assert not kb.complete_task(
+            conn,
+            task_id,
+            expected_run_id=claimed.current_run_id,
+            metadata={"published_pr": contract},
+        )
+        task = kb.get_task(conn, task_id)
+        events = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id", (task_id,)
+        ).fetchall()
+
+    receipts = [json.loads(payload) for kind, payload in events if kind == "pr_acceptance"]
+    assert task is not None
+    assert task.status == "running"
+    assert all(kind != "completed" for kind, _ in events)
+    assert len(receipts) == 1
+    assert receipts[0]["ok"] is False
+    assert receipts[0]["classification"] == classification
+    assert "CANARY_UNTRUSTED" not in json.dumps([tuple(event) for event in events])
+    assert "CANARY_UNTRUSTED" not in caplog.text
+
+
+@pytest.mark.parametrize("status", ("queued", "in_progress", "waiting", "requested", "pending"))
+def test_known_nonterminal_check_run_statuses_remain_pending(monkeypatch, status):
+    payloads = _acceptance_payloads()
+    payloads["checks"][0]["check_runs"][0].update(status=status, conclusion=None)
+    monkeypatch.setattr(acceptance, "_api", _payload_api(payloads))
+
+    receipt = acceptance.collect_acceptance(
+        "acme/repo", "https://github.com/acme/repo/pull/7"
+    )
+
+    assert receipt["ok"] is False
+    assert receipt["classification"] == "pending"
