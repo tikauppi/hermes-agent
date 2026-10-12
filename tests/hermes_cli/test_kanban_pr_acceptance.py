@@ -533,7 +533,7 @@ def _configure_provider_url_case(github, source, provider_url):
         head="a" * 40,
         source=source,
         provider_url=provider_url,
-        required=[{"context": "required", "app": {"databaseId": 1 if source == "check_run" else None}}],
+        required=[{"context": "required", "app": {"databaseId": 1} if source == "check_run" else None}],
     )
 
 
@@ -922,3 +922,94 @@ def test_known_nonterminal_check_run_statuses_remain_pending(monkeypatch, status
 
     assert receipt["ok"] is False
     assert receipt["classification"] == "pending"
+
+
+_MISSING_APP = object()
+_APP_IDENTITY_CASES = (
+    ("empty-app", {}, "required", 1, "infra", False),
+    ("null-database-id", {"databaseId": None}, "required", 1, "infra", False),
+    ("missing-app", _MISSING_APP, "required", 1, "infra", False),
+    ("wrong-app-object-type", "CANARY_UNTRUSTED_APP", "required", 1, "infra", False),
+    ("database-id-wrong-primitive", {"databaseId": "CANARY_UNTRUSTED_ID"}, "required", 1, "infra", False),
+    ("database-id-zero", {"databaseId": 0}, "required", 1, "infra", False),
+    ("database-id-negative", {"databaseId": -1}, "required", 1, "infra", False),
+    ("wrong-positive-app-id", {"databaseId": 2}, "required", 1, "missing", False),
+    ("correct-positive-app-id", {"databaseId": 1}, "required", 1, "success", True),
+    ("correct-check-name-wrong-producer", {"databaseId": 1}, "required", 2, "missing", False),
+    ("malformed-producer-valid-check", {"databaseId": "CANARY_UNTRUSTED"}, "required", 1, "infra", False),
+    ("valid-producer-wrong-check-name", {"databaseId": 1}, "other", 1, "missing", False),
+    ("explicitly-unrestricted-producer", None, "required", 1, "success", True),
+    ("producer-bound-required-check", {"databaseId": 1}, "required", 1, "success", True),
+)
+
+
+def _app_identity_payloads(app, check_name, run_app_id):
+    payloads = _acceptance_payloads()
+    required = payloads["graphql"]["data"]["repository"]["pullRequest"]["baseRef"]
+    required = required["branchProtectionRule"]["requiredStatusChecks"][0]
+    if app is _MISSING_APP:
+        required.pop("app")
+    else:
+        required["app"] = app
+    run = payloads["checks"][0]["check_runs"][0]
+    run["name"] = check_name
+    run["app"] = {"id": run_app_id}
+    return payloads
+
+
+@pytest.mark.parametrize(
+    ("case", "app", "check_name", "run_app_id", "classification", "expected_ok"),
+    _APP_IDENTITY_CASES,
+)
+def test_graphql_required_check_app_identity_matrix_fails_closed_before_policy_evaluation(
+    monkeypatch, caplog, case, app, check_name, run_app_id, classification, expected_ok
+):
+    monkeypatch.setattr(
+        acceptance, "_api", _payload_api(_app_identity_payloads(app, check_name, run_app_id))
+    )
+
+    receipt = acceptance.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+
+    assert receipt["ok"] is expected_ok, case
+    assert receipt["classification"] == classification, case
+    assert "CANARY_UNTRUSTED" not in json.dumps(receipt)
+    assert "CANARY_UNTRUSTED" not in caplog.text
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize(
+    ("case", "app", "check_name", "run_app_id", "classification", "expected_ok"),
+    _APP_IDENTITY_CASES,
+)
+def test_graphql_required_check_app_identity_matrix_cannot_bypass_disposable_completion(
+    monkeypatch, caplog, case, app, check_name, run_app_id, classification, expected_ok
+):
+    contract = "https://github.com/acme/repo/pull/7"
+    monkeypatch.setattr(
+        acceptance, "_api", _payload_api(_app_identity_payloads(app, check_name, run_app_id))
+    )
+
+    with connect() as conn:
+        task_id = kb.create_task(conn, title=f"app-identity-{case}", completion_contract=contract)
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        assert kb.complete_task(
+            conn,
+            task_id,
+            expected_run_id=claimed.current_run_id,
+            metadata={"published_pr": contract},
+        ) is expected_ok
+        task = kb.get_task(conn, task_id)
+        events = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id", (task_id,)
+        ).fetchall()
+
+    receipts = [json.loads(payload) for kind, payload in events if kind == "pr_acceptance"]
+    assert task is not None
+    assert task.status == ("done" if expected_ok else "running"), case
+    assert any(kind == "completed" for kind, _ in events) is expected_ok, case
+    assert len(receipts) == 1
+    assert receipts[0]["ok"] is expected_ok
+    assert receipts[0]["classification"] == classification
+    assert "CANARY_UNTRUSTED" not in json.dumps([tuple(event) for event in events])
+    assert "CANARY_UNTRUSTED" not in caplog.text

@@ -225,9 +225,10 @@ def _graphql_pr(payload: Any) -> dict:
             if not isinstance(checks, list):
                 _schema_error()
             for check in checks:
-                app = check.get("app") if isinstance(check, dict) else None
-                database_id = app.get("databaseId") if isinstance(app, dict) else None
-                if not isinstance(check, dict) or not _is_check_name(check.get("context")) or (app is not None and (not isinstance(app, dict) or (database_id is not None and not _is_positive_int(database_id)))):
+                if not isinstance(check, dict) or not _is_check_name(check.get("context")) or "app" not in check:
+                    _schema_error()
+                app = check["app"]
+                if app is not None and (not isinstance(app, dict) or not _is_positive_int(app.get("databaseId"))):
                     _schema_error()
     return pr
 
