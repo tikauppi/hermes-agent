@@ -1,4 +1,5 @@
 """Lifecycle invariants using real SQLite and a local authenticated GitHub API."""
+import copy
 import http.client
 import json
 import threading
@@ -184,6 +185,227 @@ def test_malformed_http_protocol_is_redacted_infra_receipt(monkeypatch, error_ty
     assert receipt["ok"] is False
     assert receipt["classification"] == "infra"
     assert "synthetic" not in json.dumps(receipt)
+
+
+def test_current_pr_array_root_is_redacted_infra_instead_of_escaping(monkeypatch):
+    sha = "a" * 40
+
+    def fake_api(endpoint, *, query=None, paginate=False):
+        if query is not None:
+            return {"data": {"repository": {"pullRequest": {
+                "headRefOid": sha,
+                "baseRefName": "main",
+                "state": "OPEN",
+                "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
+                    {"context": "required", "app": {"databaseId": 1}},
+                ]}},
+            }}}}
+        if "/rules/branches/" in endpoint:
+            return [[]]
+        if "/check-runs" in endpoint:
+            return [{"total_count": 1, "check_runs": [{
+                "id": 42,
+                "name": "required",
+                "head_sha": sha,
+                "app": {"id": 1},
+                "status": "completed",
+                "conclusion": "success",
+            }]}]
+        if "/statuses" in endpoint:
+            return [[]]
+        if "/pulls/7" in endpoint:
+            return []
+        raise AssertionError(endpoint)
+
+    monkeypatch.setattr(acceptance, "_api", fake_api)
+
+    receipt = acceptance.collect_acceptance(
+        "acme/repo", "https://github.com/acme/repo/pull/7"
+    )
+
+    assert receipt["ok"] is False
+    assert receipt["classification"] == "infra"
+    assert "GitHub acceptance evidence" in receipt["detail"]
+
+
+def _acceptance_payloads():
+    sha = "a" * 40
+    return {
+        "graphql": {"data": {"repository": {"pullRequest": {
+            "headRefOid": sha,
+            "baseRefName": "main",
+            "state": "OPEN",
+            "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
+                {"context": "required", "app": {"databaseId": 1}},
+            ]}},
+        }}}},
+        "rules": [[]],
+        "checks": [{"total_count": 1, "check_runs": [{
+            "id": 42,
+            "name": "required",
+            "head_sha": sha,
+            "app": {"id": 1},
+            "status": "completed",
+            "conclusion": "success",
+        }]}],
+        "statuses": [[]],
+        "current": {
+            "number": 7,
+            "html_url": "https://github.com/acme/repo/pull/7",
+            "head": {"sha": sha},
+            "base": {"ref": "main", "repo": {"full_name": "acme/repo"}},
+            "state": "open",
+        },
+    }
+
+
+def _payload_api(payloads):
+    def fake_api(endpoint, *, query=None, paginate=False):
+        if query is not None:
+            return payloads["graphql"]
+        if "/rules/branches/" in endpoint:
+            return payloads["rules"]
+        if "/check-runs" in endpoint:
+            return payloads["checks"]
+        if "/statuses" in endpoint:
+            return payloads["statuses"]
+        if "/pulls/7" in endpoint:
+            return payloads["current"]
+        raise AssertionError(endpoint)
+
+    return fake_api
+
+
+_REST_SCHEMA_INVALID_CASES = (
+    ("current-array", "current", []),
+    ("current-null", "current", None),
+    ("current-string", "current", "CANARY_UNTRUSTED"),
+    ("current-number", "current", 7),
+    ("current-bool", "current", True),
+    ("current-empty", "current", {}),
+    ("current-missing-head", "current", {
+        "number": 7,
+        "html_url": "https://github.com/acme/repo/pull/7",
+        "base": {"ref": "main", "repo": {"full_name": "acme/repo"}},
+        "state": "open",
+    }),
+    ("current-wrong-head", "current", {
+        "number": 7,
+        "html_url": "https://github.com/acme/repo/pull/7",
+        "head": [],
+        "base": {"ref": "main", "repo": {"full_name": "acme/repo"}},
+        "state": "open",
+    }),
+    ("current-wrong-base", "current", {
+        "number": 7,
+        "html_url": "https://github.com/acme/repo/pull/7",
+        "head": {"sha": "a" * 40},
+        "base": "CANARY_UNTRUSTED",
+        "state": "open",
+    }),
+    ("current-wrong-repository-identity", "current", {
+        "number": 7,
+        "html_url": "https://github.com/acme/repo/pull/7",
+        "head": {"sha": "a" * 40},
+        "base": {"ref": "main", "repo": {"full_name": ["CANARY_UNTRUSTED"]}},
+        "state": "open",
+    }),
+    ("rules-wrong-page", "rules", [{}]),
+    ("rules-missing-type", "rules", [[{}]]),
+    ("rules-wrong-required-checks", "rules", [[{
+        "type": "required_status_checks",
+        "parameters": {"required_status_checks": "CANARY_UNTRUSTED"},
+    }]]),
+    ("checks-wrong-page", "checks", [[]]),
+    ("checks-wrong-list", "checks", [{"total_count": 1, "check_runs": None}]),
+    ("checks-wrong-run", "checks", [{"total_count": 1, "check_runs": [[]]}]),
+    ("checks-missing-identity", "checks", [{"total_count": 1, "check_runs": [{
+        "id": 42,
+        "head_sha": "a" * 40,
+        "app": {"id": 1},
+        "status": "completed",
+        "conclusion": "success",
+        "untrusted": "CANARY_UNTRUSTED",
+    }]}]),
+    ("checks-wrong-app", "checks", [{"total_count": 1, "check_runs": [{
+        "id": 42,
+        "name": "required",
+        "head_sha": "a" * 40,
+        "app": "CANARY_UNTRUSTED",
+        "status": "completed",
+        "conclusion": "success",
+    }]}]),
+    ("statuses-wrong-page", "statuses", [{}]),
+    ("statuses-wrong-entry", "statuses", [["CANARY_UNTRUSTED"]]),
+    ("statuses-missing-identity", "statuses", [[{
+        "id": 43,
+        "sha": "a" * 40,
+        "state": "success",
+        "untrusted": "CANARY_UNTRUSTED",
+    }]]),
+)
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize(("case", "endpoint", "malformed"), _REST_SCHEMA_INVALID_CASES)
+def test_rest_schema_invalid_evidence_fails_closed_without_terminal_mutation(
+    github, monkeypatch, caplog, case, endpoint, malformed
+):
+    payloads = _acceptance_payloads()
+    payloads[endpoint] = copy.deepcopy(malformed)
+    monkeypatch.setattr(acceptance, "_api", _payload_api(payloads))
+    contract = "https://github.com/acme/repo/pull/7"
+
+    with connect() as conn:
+        tid = kb.create_task(conn, title=f"schema-{case}", completion_contract=contract)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+
+        assert not kb.complete_task(
+            conn,
+            tid,
+            expected_run_id=run_id,
+            metadata={"published_pr": contract},
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        rows = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id", (tid,)
+        ).fetchall()
+
+    receipts = [json.loads(payload) for kind, payload in rows if kind == "pr_acceptance"]
+    assert task.status == "running"
+    assert task.current_run_id == run_id
+    assert all(kind != "completed" for kind, _ in rows)
+    assert len(receipts) == 1
+    assert receipts[0]["ok"] is False
+    assert receipts[0]["classification"] == "infra"
+    assert "GitHub acceptance evidence" in receipts[0]["detail"]
+    assert "CANARY_UNTRUSTED" not in json.dumps([tuple(row) for row in rows])
+    assert "CANARY_UNTRUSTED" not in caplog.text
+
+
+@pytest.mark.linux_only
+def test_rest_schema_allows_additional_fields_without_persisting_them(github, monkeypatch):
+    payloads = _acceptance_payloads()
+    for value in payloads.values():
+        if isinstance(value, dict):
+            value["untrusted"] = "CANARY_UNTRUSTED"
+    payloads["rules"][0].append({"type": "advisory", "untrusted": "CANARY_UNTRUSTED"})
+    payloads["checks"][0]["untrusted"] = "CANARY_UNTRUSTED"
+    payloads["checks"][0]["check_runs"][0]["untrusted"] = "CANARY_UNTRUSTED"
+    payloads["current"]["head"]["untrusted"] = "CANARY_UNTRUSTED"
+    payloads["current"]["base"]["repo"]["untrusted"] = "CANARY_UNTRUSTED"
+    monkeypatch.setattr(acceptance, "_api", _payload_api(payloads))
+
+    receipt = acceptance.collect_acceptance(
+        "acme/repo", "https://github.com/acme/repo/pull/7"
+    )
+
+    assert receipt["ok"] is True
+    assert receipt["classification"] == "success"
+    assert "CANARY_UNTRUSTED" not in json.dumps(receipt)
 
 
 _SAFE_PROVIDER_URL = "https://github.com/acme/repo/actions/runs/42"

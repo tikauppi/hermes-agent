@@ -10,7 +10,7 @@ import json
 import re
 import urllib.error
 import urllib.request
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, NoReturn
 from urllib.parse import quote, urlsplit
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -181,6 +181,139 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False) -> 
     raise _GitHubApiError("infra")
 
 
+def _schema_error() -> NoReturn:
+    raise _GitHubApiError("infra")
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _graphql_pr(payload: Any) -> dict:
+    if not isinstance(payload, dict):
+        _schema_error()
+    data = payload.get("data")
+    repository = data.get("repository") if isinstance(data, dict) else None
+    pr = repository.get("pullRequest") if isinstance(repository, dict) else None
+    if not isinstance(pr, dict):
+        _schema_error()
+    if not all(isinstance(pr.get(key), str) for key in ("headRefOid", "baseRefName", "state")):
+        _schema_error()
+    base_ref = pr.get("baseRef")
+    if base_ref is not None:
+        if not isinstance(base_ref, dict):
+            _schema_error()
+        protection = base_ref.get("branchProtectionRule")
+        if protection is not None:
+            if not isinstance(protection, dict):
+                _schema_error()
+            checks = protection.get("requiredStatusChecks")
+            if not isinstance(checks, list):
+                _schema_error()
+            for check in checks:
+                if not isinstance(check, dict) or not isinstance(check.get("context"), str):
+                    _schema_error()
+                app = check.get("app")
+                if app is not None:
+                    if not isinstance(app, dict):
+                        _schema_error()
+                    database_id = app.get("databaseId")
+                    if database_id is not None and not _is_int(database_id):
+                        _schema_error()
+    return pr
+
+
+def _rules_pages(payload: Any) -> list[list[dict]]:
+    if not isinstance(payload, list):
+        _schema_error()
+    for page in payload:
+        if not isinstance(page, list):
+            _schema_error()
+        for rule in page:
+            if not isinstance(rule, dict) or not isinstance(rule.get("type"), str):
+                _schema_error()
+            if rule["type"] != "required_status_checks":
+                continue
+            parameters = rule.get("parameters")
+            checks = parameters.get("required_status_checks") if isinstance(parameters, dict) else None
+            if not isinstance(checks, list):
+                _schema_error()
+            for check in checks:
+                if not isinstance(check, dict) or not isinstance(check.get("context"), str):
+                    _schema_error()
+                integration_id = check.get("integration_id")
+                if integration_id is not None and not _is_int(integration_id):
+                    _schema_error()
+    return payload
+
+
+def _check_run_pages(payload: Any) -> list[dict]:
+    if not isinstance(payload, list) or not payload:
+        _schema_error()
+    for page in payload:
+        if not isinstance(page, dict) or not _is_int(page.get("total_count")):
+            _schema_error()
+        runs = page.get("check_runs")
+        if not isinstance(runs, list):
+            _schema_error()
+        for run in runs:
+            if not isinstance(run, dict):
+                _schema_error()
+            app = run.get("app")
+            if (
+                not _is_int(run.get("id"))
+                or not isinstance(run.get("name"), str)
+                or not isinstance(run.get("head_sha"), str)
+                or not isinstance(app, dict)
+                or not _is_int(app.get("id"))
+                or not isinstance(run.get("status"), str)
+                or (run.get("conclusion") is not None and not isinstance(run.get("conclusion"), str))
+            ):
+                _schema_error()
+    return payload
+
+
+def _status_pages(payload: Any) -> list[list[dict]]:
+    if not isinstance(payload, list):
+        _schema_error()
+    for page in payload:
+        if not isinstance(page, list):
+            _schema_error()
+        for status in page:
+            if (
+                not isinstance(status, dict)
+                or not _is_int(status.get("id"))
+                or not isinstance(status.get("context"), str)
+                or not isinstance(status.get("sha"), str)
+                or not isinstance(status.get("state"), str)
+            ):
+                _schema_error()
+    return payload
+
+
+def _current_pr(payload: Any) -> dict:
+    if not isinstance(payload, dict):
+        _schema_error()
+    head = payload.get("head")
+    base = payload.get("base")
+    repository = base.get("repo") if isinstance(base, dict) else None
+    if (
+        not _is_int(payload.get("number"))
+        or not isinstance(payload.get("html_url"), str)
+        or not isinstance(payload.get("state"), str)
+        or not isinstance(head, dict)
+        or not isinstance(head.get("sha"), str)
+        or not isinstance(base, dict)
+        or not isinstance(base.get("ref"), str)
+        or not isinstance(repository, dict)
+        or not isinstance(repository.get("full_name"), str)
+    ):
+        _schema_error()
+    if payload["state"] == "closed" and not isinstance(payload.get("merged"), bool):
+        _schema_error()
+    return payload
+
+
 def collect_acceptance(contract: str, published_pr: str | None) -> dict:
     receipt = {"ok": False, "classification": "missing", "head_sha": None,
                "pr_url": published_pr, "checks": [],
@@ -199,7 +332,7 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
         query = '''{repository(owner:%s,name:%s){pullRequest(number:%d){headRefOid baseRefName state
             baseRef{branchProtectionRule{requiredStatusChecks{context app{databaseId}}}}}}}''' % (
                 json.dumps(owner), json.dumps(name), number)
-        pr = _api("graphql", query=query)["data"]["repository"]["pullRequest"]
+        pr = _graphql_pr(_api("graphql", query=query))
         sha, branch = pr["headRefOid"], pr["baseRefName"]
         receipt["head_sha"] = sha
         if not re.fullmatch(r"[0-9a-f]{40}", sha) or pr["state"] not in {"OPEN", "MERGED"}:
@@ -209,7 +342,9 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
             (r["context"], (r.get("app") or {}).get("databaseId"))
             for r in protection.get("requiredStatusChecks", [])
         }
-        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100", paginate=True)
+        rules = _rules_pages(
+            _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100", paginate=True)
+        )
         for page in rules:
             for rule in page:
                 if rule["type"] == "required_status_checks":
@@ -228,11 +363,16 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
         if not required:
             receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
             return receipt
-        pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest", paginate=True)
+        pages = _check_run_pages(
+            _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest", paginate=True)
+        )
         runs = [run for page in pages for run in page["check_runs"]]
         if len({r["id"] for r in runs}) != pages[0]["total_count"]:
             raise ValueError("Incomplete check-run pagination")
-        statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100", paginate=True) for s in page]
+        status_pages = _status_pages(
+            _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100", paginate=True)
+        )
+        statuses = [{**s, "sha": sha} for page in status_pages for s in page]
         outcomes = []
         for context, app_id in sorted(required, key=str):
             matching = [r for r in runs if r["name"] == context and
@@ -258,7 +398,7 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
                     check_receipt["url"] = safe_url
                 receipt["checks"].append(check_receipt)
         # Re-read after all pages: old-head successes are never transferable.
-        current = _api(f"repos/{repo}/pulls/{number}")
+        current = _current_pr(_api(f"repos/{repo}/pulls/{number}"))
         provenance_ok = (
             current.get("number") == number
             and current.get("html_url") == url
