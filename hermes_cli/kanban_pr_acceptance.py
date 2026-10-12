@@ -300,7 +300,7 @@ def _current_pr(payload: Any) -> dict:
     if (
         not _is_int(payload.get("number"))
         or not isinstance(payload.get("html_url"), str)
-        or not isinstance(payload.get("state"), str)
+        or payload.get("state") not in {"open", "closed"}
         or not isinstance(head, dict)
         or not isinstance(head.get("sha"), str)
         or not isinstance(base, dict)

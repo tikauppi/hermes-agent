@@ -23,6 +23,7 @@ def github(tmp_path, monkeypatch):
         "source": "check_run",
         "provider_url": "https://github.com/acme/repo/actions/runs/42",
         "required": [{"context": "required", "app": {"databaseId": 1}}],
+        "current_state": "open",
     }
 
     class Handler(BaseHTTPRequestHandler):
@@ -109,8 +110,12 @@ def github(tmp_path, monkeypatch):
                     "head": {"sha": sha, "repo": {"full_name": "acme/repo"}},
                     "base": {"ref": "main", "repo": {
                         "full_name": "other/repo" if state.get("provenance") else "acme/repo"}},
-                    "state": "open",
+                    "state": state["current_state"],
                 }
+                if state.get("omit_current_state"):
+                    value.pop("state")
+                if "current_merged" in state:
+                    value["merged"] = state["current_merged"]
             else:
                 self._reply({"message": "not found"}, 404)
                 return
@@ -226,6 +231,74 @@ def test_current_pr_array_root_is_redacted_infra_instead_of_escaping(monkeypatch
     assert receipt["ok"] is False
     assert receipt["classification"] == "infra"
     assert "GitHub acceptance evidence" in receipt["detail"]
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize(
+    ("state", "merged"),
+    (("open", None), ("closed", True)),
+)
+def test_current_pr_rest_state_enum_accepts_supported_values(github, state, merged):
+    github["current_state"] = state
+    if merged is not None:
+        github["current_merged"] = merged
+
+    receipt = acceptance.collect_acceptance(
+        "acme/repo", "https://github.com/acme/repo/pull/7"
+    )
+
+    assert receipt["ok"] is True
+    assert receipt["classification"] == "success"
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize(
+    ("case", "state", "omit_state"),
+    (
+        ("empty", "", False),
+        ("unknown", "CANARY_UNTRUSTED_STATE", False),
+        ("wrong-casing", "Open", False),
+        ("null", None, False),
+        ("number", 7, False),
+        ("boolean", True, False),
+        ("missing", "open", True),
+    ),
+)
+def test_current_pr_rest_state_enum_rejects_malformed_evidence_without_terminal_mutation(
+    github, case, state, omit_state, caplog
+):
+    github["current_state"] = state
+    github["omit_current_state"] = omit_state
+    contract = "https://github.com/acme/repo/pull/7"
+
+    with connect() as conn:
+        tid = kb.create_task(conn, title=f"state-{case}", completion_contract=contract)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+
+        assert not kb.complete_task(
+            conn,
+            tid,
+            expected_run_id=run_id,
+            metadata={"published_pr": contract},
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        rows = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id", (tid,)
+        ).fetchall()
+
+    receipts = [json.loads(payload) for kind, payload in rows if kind == "pr_acceptance"]
+    assert task.status == "running"
+    assert task.current_run_id == run_id
+    assert all(kind != "completed" for kind, _ in rows)
+    assert len(receipts) == 1
+    assert receipts[0]["ok"] is False
+    assert receipts[0]["classification"] == "infra"
+    assert "GitHub acceptance evidence" in receipts[0]["detail"]
+    assert "CANARY_UNTRUSTED_STATE" not in json.dumps([tuple(row) for row in rows])
+    assert "CANARY_UNTRUSTED_STATE" not in caplog.text
 
 
 def _acceptance_payloads():
