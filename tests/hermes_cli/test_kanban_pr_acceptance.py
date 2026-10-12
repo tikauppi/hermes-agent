@@ -192,15 +192,43 @@ _PROVIDER_URL_CASES = (
     ("fragment", f"{_SAFE_PROVIDER_URL}#CANARY_FRAGMENT", _SAFE_PROVIDER_URL),
     ("query-fragment", f"{_SAFE_PROVIDER_URL}?key=CANARY_QUERY#CANARY_FRAGMENT", _SAFE_PROVIDER_URL),
     ("explicit-https-port", f"https://github.com:443/acme/repo/actions/runs/42?CANARY_PORT", _SAFE_PROVIDER_URL),
+    (
+        "job-path",
+        "https://github.com/acme/repo/actions/runs/42/job/7?CANARY_JOB",
+        "https://github.com/acme/repo/actions/runs/42/job/7",
+    ),
+    (
+        "commit-checks-path",
+        f"https://github.com/acme/repo/commit/{'a' * 40}/checks?CANARY_CHECKS",
+        f"https://github.com/acme/repo/commit/{'a' * 40}/checks",
+    ),
+    ("empty-port", "https://github.com:/acme/repo/actions/runs/42?CANARY_EMPTY_PORT", None),
+    ("literal-dot-segment", "https://github.com/../repo/actions/runs/42?CANARY_DOT", None),
+    ("encoded-dot-segment", "https://github.com/%2e%2e/repo/actions/runs/42?CANARY_DOT_ENCODED", None),
+    (
+        "double-encoded-dot-segment",
+        "https://github.com/%252e%252e/repo/actions/runs/42?CANARY_DOT_DOUBLE",
+        None,
+    ),
     ("wrong-host", "https://ci.invalid/acme/repo/actions/runs/42?CANARY_WRONG_HOST", None),
     ("userinfo-spoof", "https://github.com@ci.invalid/acme/repo/actions/runs/42?CANARY_USERINFO", None),
     ("embedded-credential", "https://CANARY_CREDENTIAL@github.com/acme/repo/actions/runs/42", None),
     ("unsupported-scheme", "http://github.com/acme/repo/actions/runs/42?CANARY_SCHEME", None),
     ("malformed", "https://[github.com/CANARY_MALFORMED", None),
+    ("malformed-authority", "https:///github.com/acme/repo/actions/runs/42?CANARY_AUTHORITY_MISSING", None),
     ("missing", None, None),
     ("encoded-authority", "https://github.com%40ci.invalid/acme/repo/actions/runs/42?CANARY_AUTHORITY", None),
+    ("encoded-host", "https://github%2ecom/acme/repo/actions/runs/42?CANARY_HOST_ENCODING", None),
     ("encoded-path", "https://github.com/acme/repo/actions/%72uns/42?CANARY_ENCODING", None),
     ("unsafe-port", "https://github.com:444/acme/repo/actions/runs/42?CANARY_UNSAFE_PORT", None),
+    ("invalid-port", "https://github.com:not-a-port/acme/repo/actions/runs/42?CANARY_INVALID_PORT", None),
+    ("control-character", "https://github.com/acme/repo/actions/runs/42\x1f?CANARY_CONTROL", None),
+    ("delete-control-character", "https://github.com/acme/repo/actions/runs/42\x7f?CANARY_DELETE", None),
+    (
+        "ambiguous-backslash",
+        "https://github.com\\@ci.invalid/acme/repo/actions/runs/42?CANARY_AMBIGUOUS",
+        None,
+    ),
 )
 
 
@@ -216,53 +244,55 @@ def _configure_provider_url_case(github, source, provider_url):
 
 @pytest.mark.linux_only
 @pytest.mark.parametrize("source", ("check_run", "legacy"))
+@pytest.mark.parametrize("sink", ("returned_receipt", "sqlite_event"))
 @pytest.mark.parametrize(("case", "provider_url", "expected_url"), _PROVIDER_URL_CASES)
-def test_provider_urls_are_sanitized_in_returned_receipt(
-    github, caplog, source, case, provider_url, expected_url
+def test_provider_urls_are_sanitized_before_receipt_persistence(
+    github, caplog, source, sink, case, provider_url, expected_url
 ):
     _configure_provider_url_case(github, source, provider_url)
 
-    receipt = acceptance.collect_acceptance(
-        "acme/repo", "https://github.com/acme/repo/pull/7"
-    )
-
-    assert receipt["ok"] is True, case
-    check = next(item for item in receipt["checks"] if item["name"] == "required")
-    if expected_url is None:
-        assert "url" not in check
-    else:
-        assert check["url"] == expected_url
-    assert "CANARY_" not in json.dumps(receipt)
-    assert "CANARY_" not in caplog.text
-
-
-@pytest.mark.linux_only
-@pytest.mark.parametrize("source", ("check_run", "legacy"))
-@pytest.mark.parametrize(("case", "provider_url", "expected_url"), _PROVIDER_URL_CASES)
-def test_provider_urls_are_sanitized_in_sqlite_acceptance_event(
-    github, caplog, source, case, provider_url, expected_url
-):
-    _configure_provider_url_case(github, source, provider_url)
-
-    with connect() as conn:
-        tid = kb.create_task(conn, title=f"url-{source}-{case}", completion_contract="acme/repo")
-        assert kb.complete_task(
-            conn, tid, metadata={"published_pr": "https://github.com/acme/repo/pull/7"}
+    if sink == "returned_receipt":
+        receipt = acceptance.collect_acceptance(
+            "acme/repo", "https://github.com/acme/repo/pull/7"
         )
-        assert kb.get_task(conn, tid).status == "done"
-        rows = conn.execute(
-            "SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id", (tid,)
-        ).fetchall()
+        persisted = []
+    else:
+        with connect() as conn:
+            tid = kb.create_task(
+                conn, title=f"url-{source}-{case}", completion_contract="acme/repo"
+            )
+            assert kb.complete_task(
+                conn,
+                tid,
+                metadata={"published_pr": "https://github.com/acme/repo/pull/7"},
+            )
+            assert kb.get_task(conn, tid).status == "done"
+            rows = conn.execute(
+                "SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id",
+                (tid,),
+            ).fetchall()
+        receipt = next(
+            json.loads(payload) for kind, payload in rows if kind == "pr_acceptance"
+        )
+        persisted = [(kind, json.loads(payload)) for kind, payload in rows]
 
-    receipt = next(json.loads(payload) for kind, payload in rows if kind == "pr_acceptance")
+    assert receipt["ok"] is True, (source, sink, case)
     check = next(item for item in receipt["checks"] if item["name"] == "required")
     if expected_url is None:
         assert "url" not in check
     else:
         assert check["url"] == expected_url
-    serialized_events = json.dumps([(kind, json.loads(payload)) for kind, payload in rows])
+
+    serialized_receipt = json.dumps(receipt)
+    serialized_events = json.dumps(persisted)
+    assert "CANARY_" not in serialized_receipt
     assert "CANARY_" not in serialized_events
     assert "CANARY_" not in caplog.text
+    if provider_url is not None and expected_url is None:
+        assert provider_url not in str(receipt)
+        assert provider_url not in serialized_receipt
+        assert provider_url not in serialized_events
+        assert provider_url not in caplog.text
 
 
 @pytest.mark.linux_only

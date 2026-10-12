@@ -132,15 +132,22 @@ def _sanitize_provider_url(value: Any) -> str | None:
     """Return only canonical GitHub check/status links safe for receipts."""
     if not isinstance(value, str) or not value or not value.isascii():
         return None
-    if any(character.isspace() or ord(character) < 0x20 for character in value):
+    if any(
+        character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F
+        for character in value
+    ):
         return None
     try:
         parsed = urlsplit(value)
         port = parsed.port
     except ValueError:
         return None
+    dot_segment = any(
+        segment and not segment.strip(".") for segment in parsed.path.split("/")
+    )
     if (
         parsed.scheme != "https"
+        or parsed.netloc not in {"github.com", "github.com:443"}
         or parsed.hostname != "github.com"
         or parsed.username is not None
         or parsed.password is not None
@@ -149,6 +156,7 @@ def _sanitize_provider_url(value: Any) -> str | None:
         or "%" in parsed.path
         or "\\" in parsed.netloc
         or "\\" in parsed.path
+        or dot_segment
         or not _GITHUB_RECEIPT_PATH.fullmatch(parsed.path)
     ):
         return None
